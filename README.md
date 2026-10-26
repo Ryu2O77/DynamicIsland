@@ -1,3 +1,5 @@
+THIS PROJECT WAS MADE WITH AI FOR PERSONAL USE!
+
 # Dynamic Island para Windows
 
 Una "dynamic island" ligera para Windows hecha en Rust: una píldora negra pegada al borde superior de la pantalla que se expande al pasar el mouse y muestra música, reloj, temporizador, cronómetro y calculadora.
