@@ -1,6 +1,6 @@
 [package]
 name = "dynamic_island"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies.windows]
@@ -8,9 +8,11 @@ version = "0.58"
 features = [
     "Foundation",
     "Foundation_Collections",
+    "Data_Json",
     "Graphics_Imaging",
     "Media_Control",
     "Storage_Streams",
+    "Web_Http",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

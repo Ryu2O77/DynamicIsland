@@ -1,9 +1,9 @@
 #![windows_subsystem = "windows"]
 
-//! Dynamic Island para Windows (v0.4)
-//! Paginas (Musica, Reloj, Timer, Crono, Calculadora, Ajustes), configuracion
-//! con interruptores guardada en %APPDATA%\DynamicIsland\config.ini.
-//! Render por software + texto GDI; los timers solo corren cuando hace falta.
+//! Dynamic Island para Windows (v0.5)
+//! Paginas: Musica, Letras, Reloj, Calendario, Timer, Crono, Calculadora, Tareas, Ajustes.
+//! Temas (Clasico / NieR), estilo isla o notch, mover libremente, opacidad por
+//! proximidad, fuente elegible. Configuracion en %APPDATA%\DynamicIsland\config.ini.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::{w, Interface, PCWSTR};
-use windows::Foundation::TimeSpan;
+use windows::core::{w, Interface, HSTRING, PCWSTR};
+use windows::Data::Json::{JsonArray, JsonObject};
+use windows::Foundation::{TimeSpan, Uri};
 use windows::Graphics::Imaging::{
     BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, BitmapTransform, ColorManagementMode,
     ExifOrientationMode,
@@ -23,6 +24,7 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlayStatus,
 };
 use windows::Storage::Streams::IRandomAccessStream;
+use windows::Web::Http::HttpClient;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
@@ -34,8 +36,8 @@ use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTimeAsFil
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, SetFocus, TrackMouseEvent, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, TME_LEAVE,
-    TRACKMOUSEEVENT,
+    keybd_event, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
@@ -45,9 +47,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ------------------------------------------------------------ constantes
 
-const CW: f32 = 500.0; // lienzo (logico)
-const CH: f32 = 350.0;
-const TOP: f32 = 8.0; // separacion con el borde superior
+const CW: f32 = 520.0; // lienzo (logico)
+const CH: f32 = 390.0;
+const TOP: f32 = 8.0; // separacion con el borde superior (estilo isla)
+const EW: f32 = 440.0; // ancho de la isla expandida
 const CS: usize = 96; // lado de la caratula decodificada
 
 const WM_APP_MEDIA: u32 = 0x8000 + 1;
@@ -55,9 +58,11 @@ const WM_TRAY: u32 = 0x8000 + 2;
 const WM_APP_FRAME: u32 = 0x8000 + 3;
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 const MA_NOACTIVATE_: isize = 3;
+const MA_ACTIVATE_: isize = 1;
 
 const T_CLOCK: usize = 2;
 const T_VIS: usize = 3;
+const T_PROX: usize = 4;
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ANIM_ON: AtomicBool = AtomicBool::new(false);
@@ -67,12 +72,122 @@ static MUSIC_ON: AtomicBool = AtomicBool::new(true);
 static COVER_ON: AtomicBool = AtomicBool::new(true);
 
 type Rgb = (f32, f32, f32);
-const WHITE: Rgb = (255.0, 255.0, 255.0);
-const BLACK: Rgb = (0.0, 0.0, 0.0);
-const ORANGE: Rgb = (255.0, 159.0, 10.0);
-const GREEN: Rgb = (48.0, 209.0, 88.0);
+const fn c(r: u8, g: u8, b: u8) -> Rgb {
+    (r as f32, g as f32, b as f32)
+}
+const WHITE: Rgb = c(255, 255, 255);
+const ORANGE: Rgb = c(255, 159, 10);
+const GREEN: Rgb = c(48, 209, 88);
 
-// funciones que se pueden activar/desactivar
+// ------------------------------------------------------------ temas
+
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Rgb,
+    fg: Rgb,
+    fg2: Rgb,
+    accent: Rgb,
+    on_accent: Rgb,
+    good: Rgb,
+    surface: Rgb,
+    surface_hi: Rgb,
+    track: Rgb,
+    key_fn: Rgb,
+    key_fn_fg: Rgb,
+    knob: Rgb,
+    big_bg: Rgb,
+    big_fg: Rgb,
+    sharp: bool,
+    ring: f32,
+    frame: bool,
+    font: &'static str,
+}
+
+const THEME_NAMES: [&str; 3] = ["Clásico", "NieR claro", "NieR oscuro"];
+const THEMES: [Theme; 3] = [
+    Theme {
+        bg: c(0, 0, 0),
+        fg: WHITE,
+        fg2: c(165, 165, 172),
+        accent: ORANGE,
+        on_accent: WHITE,
+        good: GREEN,
+        surface: c(62, 62, 70),
+        surface_hi: c(86, 86, 94),
+        track: c(70, 70, 78),
+        key_fn: c(160, 160, 168),
+        key_fn_fg: c(0, 0, 0),
+        knob: WHITE,
+        big_bg: WHITE,
+        big_fg: c(0, 0, 0),
+        sharp: false,
+        ring: 0.14,
+        frame: false,
+        font: "Segoe UI",
+    },
+    Theme {
+        bg: c(218, 212, 187),
+        fg: c(74, 71, 62),
+        fg2: c(125, 121, 104),
+        accent: c(176, 72, 52),
+        on_accent: c(244, 241, 226),
+        good: c(104, 134, 86),
+        surface: c(201, 195, 168),
+        surface_hi: c(184, 178, 150),
+        track: c(188, 182, 155),
+        key_fn: c(188, 182, 155),
+        key_fn_fg: c(74, 71, 62),
+        knob: c(244, 241, 226),
+        big_bg: c(74, 71, 62),
+        big_fg: c(218, 212, 187),
+        sharp: true,
+        ring: 0.0,
+        frame: true,
+        font: "Bahnschrift",
+    },
+    Theme {
+        bg: c(66, 62, 54),
+        fg: c(218, 212, 187),
+        fg2: c(160, 155, 135),
+        accent: c(222, 96, 66),
+        on_accent: c(30, 28, 24),
+        good: c(140, 170, 110),
+        surface: c(86, 81, 70),
+        surface_hi: c(106, 100, 86),
+        track: c(98, 93, 80),
+        key_fn: c(120, 114, 98),
+        key_fn_fg: c(34, 32, 26),
+        knob: c(228, 223, 200),
+        big_bg: c(218, 212, 187),
+        big_fg: c(66, 62, 54),
+        sharp: true,
+        ring: 0.0,
+        frame: true,
+        font: "Bahnschrift",
+    },
+];
+
+fn theme_of(i: u8) -> Theme {
+    THEMES[(i as usize).min(THEMES.len() - 1)]
+}
+
+const FONTS: [&str; 12] = [
+    "Automática",
+    "Segoe UI",
+    "Bahnschrift",
+    "Segoe UI Variable",
+    "Cascadia Code",
+    "Consolas",
+    "Georgia",
+    "Cambria",
+    "Trebuchet MS",
+    "Calibri",
+    "Verdana",
+    "Courier New",
+];
+
+// ------------------------------------------------------------ funciones activables
+
 const F_MUSIC: usize = 0;
 const F_COVER: usize = 1;
 const F_VIS: usize = 2;
@@ -84,8 +199,15 @@ const F_BATT: usize = 7;
 const F_FULLSCREEN: usize = 8;
 const F_VOLUME: usize = 9;
 const F_SHADOW: usize = 10;
-const F_COUNT: usize = 11;
+const F_LYRICS: usize = 11;
+const F_CALENDAR: usize = 12;
+const F_TODO: usize = 13;
+const F_NOTIF: usize = 14;
+const F_PROX: usize = 15;
+const F_DRAG: usize = 16;
+const F_COUNT: usize = 17;
 
+// (clave en config.ini, etiqueta)
 const FEATURES: [(&str, &str); F_COUNT] = [
     ("music", "Música"),
     ("cover", "Carátula"),
@@ -95,9 +217,20 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("stopwatch", "Cronómetro"),
     ("calculator", "Calculadora"),
     ("battery", "Aviso de batería"),
-    ("fullscreen", "Ocultar en fullscreen"),
+    ("fullscreen", "Ocultar en pantalla completa"),
     ("volume", "Volumen con la rueda"),
     ("shadow", "Sombra"),
+    ("lyrics", "Letras"),
+    ("calendar", "Calendario"),
+    ("todo", "Tareas"),
+    ("notif", "Botón de notificaciones"),
+    ("proximity", "Opacidad por proximidad"),
+    ("drag", "Mover libremente"),
+];
+
+// que funciones salen en la pestaña "Funciones" de Ajustes
+const FUNC_LIST: [usize; 10] = [
+    F_MUSIC, F_LYRICS, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF, F_BATT,
 ];
 
 // teclas de la calculadora: (etiqueta, estilo 0=numero 1=funcion 2=operador)
@@ -108,6 +241,23 @@ const KEYS: [(&str, u8); 20] = [
     ("1", 0), ("2", 0), ("3", 0), ("+", 2),
     ("←", 1), ("0", 0), (".", 0), ("=", 2),
 ];
+
+#[derive(Clone, Copy)]
+struct Cfg {
+    theme: u8,
+    style: u8, // 0 isla, 1 notch
+    font: u8,
+    op_min: f32,
+    prox_dist: f32,
+    dx: i32,
+    dy: i32,
+}
+
+impl Default for Cfg {
+    fn default() -> Self {
+        Cfg { theme: 0, style: 0, font: 0, op_min: 0.35, prox_dist: 300.0, dx: 0, dy: 0 }
+    }
+}
 
 // ------------------------------------------------------------ datos
 
@@ -189,10 +339,13 @@ enum Mode {
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Music,
+    Lyrics,
     Clock,
+    Calendar,
     Timer,
     Stopwatch,
     Calc,
+    Todo,
     Settings,
 }
 
@@ -206,8 +359,10 @@ enum Icon {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
+    None,
     Tab(Page),
     Pin,
+    Notif,
     Prev,
     Toggle,
     Next,
@@ -222,18 +377,38 @@ enum Act {
     Key(usize),
     Feature(usize),
     Autostart,
+    Cycle(u8, i8),
+    Slider(u8),
+    SubTab(u8),
+    CalPrev,
+    CalNext,
+    CalToday,
+    TodoToggle(usize),
+    TodoDel(usize),
+    TodoInput,
+    TodoAdd,
+    ResetPos,
 }
 
 #[derive(Clone, Copy)]
 enum WKind {
-    Tab,
+    Tab(Page),
     Pin,
+    Bell,
     Pill,
     Key(u8),
     Toggle,
     Icon(Icon),
     Big(Icon),
     Bar,
+    Chip,
+    Selector,
+    Slider,
+    Arrow(i8),
+    Check,
+    Del,
+    Input,
+    Label,
 }
 
 #[derive(Clone, Copy)]
@@ -245,7 +420,27 @@ struct Widget {
     kind: WKind,
     act: Act,
     label: &'static str,
+    label2: &'static str,
     on: bool,
+    val: f32,
+}
+
+impl Widget {
+    fn new(x: f32, y: f32, w: f32, h: f32, kind: WKind, act: Act, label: &'static str) -> Widget {
+        Widget { x, y, w, h, kind, act, label, label2: "", on: false, val: 0.0 }
+    }
+    fn on(mut self, b: bool) -> Widget {
+        self.on = b;
+        self
+    }
+    fn val(mut self, v: f32) -> Widget {
+        self.val = v;
+        self
+    }
+    fn l2(mut self, s: &'static str) -> Widget {
+        self.label2 = s;
+        self
+    }
 }
 
 struct Toast {
@@ -262,6 +457,20 @@ enum Cmd {
     Seek(f64),
 }
 
+#[derive(Default)]
+struct Lyrics {
+    key: (String, String),
+    lines: Vec<(f64, String)>,
+    plain: Vec<String>,
+    state: u8, // 0 nada, 1 buscando, 2 listas, 3 no encontradas
+}
+
+struct DragState {
+    c0: POINT,
+    p0: POINT,
+    moved: bool,
+}
+
 struct App {
     hwnd: HWND,
     mem: HDC,
@@ -269,10 +478,14 @@ struct App {
     pw: i32,
     ph: i32,
     pos: POINT,
+    home: POINT,
     s: f32,
     font_main: HFONT,
     font_small: HFONT,
     font_big: HFONT,
+    font_strike: HFONT,
+    cfg: Cfg,
+    th: Theme,
     cur: [f32; 2],
     vel: [f32; 2],
     mode: Mode,
@@ -280,12 +493,16 @@ struct App {
     prev_view: Option<(Mode, Page)>,
     layout_key: (Mode, Page, bool, bool),
     fade: f32,
+    opacity: f32,
+    opacity_target: f32,
     hover: bool,
     pinned: bool,
+    editing: bool,
     hover_act: Option<Act>,
     tracking: bool,
     animating: bool,
     vis_on: bool,
+    prox_on: bool,
     hidden: bool,
     last: Instant,
     t0: Instant,
@@ -300,6 +517,7 @@ struct App {
     low_warned: bool,
     features: [bool; F_COUNT],
     autostart: bool,
+    settings_tab: u8,
     timer_set: u64,
     timer_end: Option<Instant>,
     timer_paused: Option<f32>,
@@ -310,6 +528,15 @@ struct App {
     calc_prev: String,
     calc_done: bool,
     calc_err: bool,
+    cal_year: i32,
+    cal_month: u32,
+    todos: Vec<(bool, String)>,
+    todo_input: String,
+    todo_scroll: usize,
+    lyrics: Arc<Mutex<Lyrics>>,
+    lyr_key: (String, String),
+    slider_drag: Option<u8>,
+    drag: Option<DragState>,
     prev_fg: isize,
 }
 
@@ -329,40 +556,209 @@ fn with_app<F: FnOnce(&mut App)>(f: F) {
 
 // ------------------------------------------------------------ configuracion
 
-fn config_path() -> Option<std::path::PathBuf> {
+fn data_dir() -> Option<std::path::PathBuf> {
     let d = std::env::var_os("APPDATA")?;
-    Some(std::path::PathBuf::from(d).join("DynamicIsland").join("config.ini"))
+    Some(std::path::PathBuf::from(d).join("DynamicIsland"))
 }
 
-fn load_features() -> [bool; F_COUNT] {
+fn load_config() -> ([bool; F_COUNT], Cfg) {
     let mut f = [true; F_COUNT];
-    if let Some(p) = config_path() {
-        if let Ok(txt) = std::fs::read_to_string(p) {
+    f[F_PROX] = false; // la opacidad por proximidad es opt-in
+    let mut cfg = Cfg::default();
+    if let Some(d) = data_dir() {
+        if let Ok(txt) = std::fs::read_to_string(d.join("config.ini")) {
             for line in txt.lines() {
                 if let Some((k, v)) = line.split_once('=') {
+                    let (k, v) = (k.trim(), v.trim());
                     for (i, (key, _)) in FEATURES.iter().enumerate() {
-                        if *key == k.trim() {
-                            f[i] = v.trim() != "0";
+                        if *key == k {
+                            f[i] = v != "0";
                         }
+                    }
+                    match k {
+                        "theme" => cfg.theme = v.parse::<u8>().unwrap_or(0).min(THEMES.len() as u8 - 1),
+                        "style" => cfg.style = v.parse::<u8>().unwrap_or(0).min(1),
+                        "font" => cfg.font = v.parse::<u8>().unwrap_or(0).min(FONTS.len() as u8 - 1),
+                        "opacity_min" => cfg.op_min = v.parse::<f32>().unwrap_or(0.35).clamp(0.1, 0.9),
+                        "prox_dist" => cfg.prox_dist = v.parse::<f32>().unwrap_or(300.0).clamp(100.0, 600.0),
+                        "pos_dx" => cfg.dx = v.parse::<i32>().unwrap_or(0),
+                        "pos_dy" => cfg.dy = v.parse::<i32>().unwrap_or(0),
+                        _ => {}
                     }
                 }
             }
         }
     }
-    f
+    (f, cfg)
 }
 
-fn save_features(f: &[bool; F_COUNT]) {
-    if let Some(p) = config_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
+fn save_config(f: &[bool; F_COUNT], cfg: &Cfg) {
+    if let Some(d) = data_dir() {
+        let _ = std::fs::create_dir_all(&d);
         let mut s = String::new();
         for (i, (k, _)) in FEATURES.iter().enumerate() {
             s.push_str(&format!("{}={}\n", k, if f[i] { 1 } else { 0 }));
         }
-        let _ = std::fs::write(p, s);
+        s.push_str(&format!("theme={}\nstyle={}\nfont={}\n", cfg.theme, cfg.style, cfg.font));
+        s.push_str(&format!("opacity_min={:.2}\nprox_dist={:.0}\n", cfg.op_min, cfg.prox_dist));
+        s.push_str(&format!("pos_dx={}\npos_dy={}\n", cfg.dx, cfg.dy));
+        let _ = std::fs::write(d.join("config.ini"), s);
     }
+}
+
+fn load_todos() -> Vec<(bool, String)> {
+    let mut v = Vec::new();
+    if let Some(d) = data_dir() {
+        if let Ok(txt) = std::fs::read_to_string(d.join("todo.txt")) {
+            for line in txt.lines() {
+                if let Some((flag, text)) = line.split_once('|') {
+                    if !text.is_empty() {
+                        v.push((flag == "1", text.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+fn save_todos(t: &[(bool, String)]) {
+    if let Some(d) = data_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let mut s = String::new();
+        for (done, text) in t {
+            s.push_str(&format!("{}|{}\n", if *done { 1 } else { 0 }, text));
+        }
+        let _ = std::fs::write(d.join("todo.txt"), s);
+    }
+}
+
+// ------------------------------------------------------------ calendario
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+
+/// 0 = lunes ... 6 = domingo
+fn weekday_mon0(y: i32, m: u32, d: u32) -> u32 {
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let yy = if m < 3 { y - 1 } else { y };
+    let dow = (yy + yy / 4 - yy / 100 + yy / 400 + t[(m - 1) as usize] + d as i32).rem_euclid(7);
+    ((dow + 6) % 7) as u32
+}
+
+const MONTHS_ES: [&str; 12] = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+    "octubre", "noviembre", "diciembre",
+];
+
+// ------------------------------------------------------------ letras (lrclib.net)
+
+fn url_encode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{:02X}", b));
+        }
+    }
+    o
+}
+
+fn parse_lrc(s: &str) -> Vec<(f64, String)> {
+    let mut out: Vec<(f64, String)> = Vec::new();
+    for line in s.lines() {
+        let mut rest = line.trim();
+        let mut times: Vec<f64> = Vec::new();
+        while rest.starts_with('[') {
+            if let Some(end) = rest.find(']') {
+                let tag = &rest[1..end];
+                if let Some((m, sec)) = tag.split_once(':') {
+                    if let (Ok(m), Ok(sec)) = (m.trim().parse::<f64>(), sec.trim().parse::<f64>()) {
+                        times.push(m * 60.0 + sec);
+                    }
+                }
+                rest = rest[end + 1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        for t in times {
+            out.push((t, rest.trim().to_string()));
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+fn lyric_line(lines: &[(f64, String)], i: isize) -> &str {
+    if i < 0 || i as usize >= lines.len() {
+        ""
+    } else {
+        let t = lines[i as usize].1.as_str();
+        if t.is_empty() {
+            "…"
+        } else {
+            t
+        }
+    }
+}
+
+fn http_get(url: &str) -> windows::core::Result<String> {
+    let client = HttpClient::new()?;
+    let uri = Uri::CreateUri(&HSTRING::from(url))?;
+    let body = client.GetStringAsync(&uri)?.get()?;
+    Ok(body.to_string())
+}
+
+fn lyrics_from_obj(o: &JsonObject) -> (Vec<(f64, String)>, Vec<String>) {
+    let get = |k: &str| -> String {
+        o.GetNamedString(&HSTRING::from(k)).map(|h| h.to_string()).unwrap_or_default()
+    };
+    let synced = parse_lrc(&get("syncedLyrics"));
+    let plain: Vec<String> = get("plainLyrics").lines().map(|l| l.trim().to_string()).collect();
+    (synced, plain)
+}
+
+fn fetch_lyrics(artist: &str, title: &str, dur: f64) -> Option<(Vec<(f64, String)>, Vec<String>)> {
+    let q = format!("artist_name={}&track_name={}", url_encode(artist), url_encode(title));
+    let url = format!("https://lrclib.net/api/get?{}&duration={}", q, dur.round() as u32);
+    if let Ok(body) = http_get(&url) {
+        if let Ok(o) = JsonObject::Parse(&HSTRING::from(body.as_str())) {
+            let (synced, plain) = lyrics_from_obj(&o);
+            if !synced.is_empty() || !plain.iter().all(|l| l.is_empty()) {
+                return Some((synced, plain));
+            }
+        }
+    }
+    let url = format!("https://lrclib.net/api/search?{}", q);
+    let body = http_get(&url).ok()?;
+    let arr = JsonArray::Parse(&HSTRING::from(body.as_str())).ok()?;
+    let n = arr.Size().ok()?;
+    let mut fallback: Option<(Vec<(f64, String)>, Vec<String>)> = None;
+    for i in 0..n.min(8) {
+        if let Ok(o) = arr.GetObjectAt(i) {
+            let (synced, plain) = lyrics_from_obj(&o);
+            if !synced.is_empty() {
+                return Some((synced, plain));
+            }
+            if fallback.is_none() && !plain.iter().all(|l| l.is_empty()) {
+                fallback = Some((synced, plain));
+            }
+        }
+    }
+    fallback
 }
 
 // ------------------------------------------------------------ calculadora (motor)
@@ -734,6 +1130,7 @@ fn key_tap(vk: u8, times: i32) {
     }
 }
 
+
 // ------------------------------------------------------------ dibujo (software)
 
 #[inline]
@@ -766,6 +1163,7 @@ struct Canvas<'a> {
     b: &'a mut [u32],
     pw: usize,
     ph: usize,
+    th: Theme,
 }
 
 impl<'a> Canvas<'a> {
@@ -886,15 +1284,15 @@ impl<'a> Canvas<'a> {
     }
 
     fn battery(&mut self, x: f32, y: f32, s: f32, b: Batt, f: f32) {
-        let body = (210.0, 210.0, 214.0);
+        let body = self.th.fg2;
         self.rrect(x, y, 24.0 * s, 12.0 * s, 3.5 * s, body, f);
-        self.rrect(x + 1.6 * s, y + 1.6 * s, 20.8 * s, 8.8 * s, 2.2 * s, BLACK, f);
+        self.rrect(x + 1.6 * s, y + 1.6 * s, 20.8 * s, 8.8 * s, 2.2 * s, self.th.bg, f);
         let col = if b.ac {
-            GREEN
+            self.th.good
         } else if b.pct <= 20 {
             (255.0, 69.0, 58.0)
         } else {
-            (235.0, 235.0, 240.0)
+            self.th.fg
         };
         let len = (18.0 * b.pct as f32 / 100.0).max(1.0);
         self.rrect(x + 3.0 * s, y + 3.0 * s, len * s, 6.0 * s, 1.2 * s, col, f);
@@ -903,7 +1301,7 @@ impl<'a> Canvas<'a> {
 
     fn clock_icon(&mut self, cx: f32, cy: f32, r: f32, s: f32, c: Rgb, f: f32) {
         self.circle(cx, cy, r, c, f);
-        self.circle(cx, cy, r - 1.7 * s, BLACK, f);
+        self.circle(cx, cy, r - 1.7 * s, self.th.bg, f);
         self.rrect(cx - 0.8 * s, cy - r * 0.55, 1.6 * s, r * 0.55 + 0.8 * s, 0.8 * s, c, f);
         self.rrect(cx - 0.8 * s, cy - 0.8 * s, r * 0.5 + 0.8 * s, 1.6 * s, 0.8 * s, c, f);
     }
@@ -930,43 +1328,11 @@ impl<'a> Canvas<'a> {
 
     fn switch(&mut self, x: f32, y: f32, s: f32, on: bool, f: f32) {
         let (w, h) = (36.0 * s, 20.0 * s);
-        let col = if on { GREEN } else { (72.0, 72.0, 80.0) };
+        let col = if on { self.th.good } else { self.th.track };
         self.rrect(x, y, w, h, h / 2.0, col, f);
         let kx = if on { x + w - h / 2.0 } else { x + h / 2.0 };
-        self.circle(kx, y + h / 2.0, 8.0 * s, WHITE, f);
+        self.circle(kx, y + h / 2.0, 8.0 * s, self.th.knob, f);
     }
-}
-
-/// Un pixel del borde de la pildora: cobertura + brillo del borde interior.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn pill_pixel(x: usize, y: usize, pw: usize, cx: f32, cy: f32, hx: f32, hy: f32, r: f32, s: f32, cov: &mut [u8], buf: &mut [u32]) {
-    let d = sdf_rr(x as f32 + 0.5, y as f32 + 0.5, cx, cy, hx, hy, r);
-    let a = (0.5 - d).clamp(0.0, 1.0);
-    if a > 0.0 {
-        let i = y * pw + x;
-        cov[i] = (a * 255.0) as u8;
-        let depth = (-d).max(0.0);
-        let ring = (1.0 - depth / (1.2 * s)).max(0.0) * 0.14;
-        let g = (ring * 255.0) as u32;
-        buf[i] = (g << 16) | (g << 8) | g;
-    }
-}
-
-fn make_font(height: i32, weight: i32) -> HFONT {
-    let mut face = [0u16; 32];
-    for (i, c) in "Segoe UI".encode_utf16().enumerate() {
-        face[i] = c;
-    }
-    let lf = LOGFONTW {
-        lfHeight: -height,
-        lfWeight: weight,
-        lfCharSet: DEFAULT_CHARSET,
-        lfQuality: ANTIALIASED_QUALITY,
-        lfFaceName: face,
-        ..Default::default()
-    };
-    unsafe { CreateFontIndirectW(&lf) }
 }
 
 fn fmt_time(secs: f64) -> String {
@@ -997,20 +1363,236 @@ fn fmt_sw(secs: f64) -> String {
     }
 }
 
+
+
+// ------------------------------------------------------------ dibujo: extras
+
+fn pack(c: Rgb) -> u32 {
+    ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
+}
+
+/// Forma de la isla: rectangulo redondeado; en modo notch, extendido por encima
+/// de la pantalla y con "orejas" concavas en las esquinas superiores.
+#[derive(Clone, Copy)]
+struct Shape {
+    cx: f32,
+    cy: f32,
+    hx: f32,
+    hy: f32,
+    r: f32,
+    notch: bool,
+    ex0: f32,
+    ex1: f32,
+    e: f32,
+}
+
+impl Shape {
+    fn sdf(&self, px: f32, py: f32) -> f32 {
+        let mut d = sdf_rr(px, py, self.cx, self.cy, self.hx, self.hy, self.r);
+        if self.notch && py < self.e + 1.0 {
+            for side in 0..2 {
+                let (bx, ccx) = if side == 0 {
+                    (self.ex0 - self.e / 2.0, self.ex0 - self.e)
+                } else {
+                    (self.ex1 + self.e / 2.0, self.ex1 + self.e)
+                };
+                let qx = (px - bx).abs() - self.e / 2.0;
+                let qy = (py - self.e / 2.0).abs() - self.e / 2.0;
+                let dbox = qx.max(qy);
+                let dc = ((px - ccx) * (px - ccx) + (py - self.e) * (py - self.e)).sqrt() - self.e;
+                d = d.min(dbox.max(-dc));
+            }
+        }
+        d
+    }
+}
+
+/// Un pixel del borde de la pildora: cobertura + relleno del tema + brillo del borde.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn pill_pixel(x: usize, y: usize, pw: usize, sh: &Shape, s: f32, bgp: u32, ring: f32, cov: &mut [u8], buf: &mut [u32]) {
+    let d = sh.sdf(x as f32 + 0.5, y as f32 + 0.5);
+    let a = (0.5 - d).clamp(0.0, 1.0);
+    if a > 0.0 {
+        let i = y * pw + x;
+        cov[i] = (a * 255.0) as u8;
+        let mut p = bgp;
+        if ring > 0.0 {
+            let depth = (-d).max(0.0);
+            let rg = (1.0 - depth / (1.2 * s)).max(0.0) * ring;
+            if rg > 0.0 {
+                blend(&mut p, WHITE, rg);
+            }
+        }
+        buf[i] = p;
+    }
+}
+
+fn make_font(face: &str, height: i32, weight: i32, strike: bool) -> HFONT {
+    let mut name = [0u16; 32];
+    for (i, ch) in face.encode_utf16().take(31).enumerate() {
+        name[i] = ch;
+    }
+    let lf = LOGFONTW {
+        lfHeight: -height,
+        lfWeight: weight,
+        lfStrikeOut: if strike { 1 } else { 0 },
+        lfCharSet: DEFAULT_CHARSET,
+        lfQuality: ANTIALIASED_QUALITY,
+        lfFaceName: name,
+        ..Default::default()
+    };
+    unsafe { CreateFontIndirectW(&lf) }
+}
+
+impl<'a> Canvas<'a> {
+    fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, t: f32, col: Rgb, f: f32) {
+        let (dx, dy) = (x2 - x1, y2 - y1);
+        let l = dx.hypot(dy).max(1e-4);
+        let (nx, ny) = (-dy / l * t / 2.0, dx / l * t / 2.0);
+        self.poly(&[(x1 + nx, y1 + ny), (x2 + nx, y2 + ny), (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)], col, f);
+    }
+
+    fn arrow(&mut self, dir: i8, cx: f32, cy: f32, s: f32, col: Rgb, f: f32) {
+        if dir < 0 {
+            self.poly(&[(cx + 3.0 * s, cy - 5.0 * s), (cx + 3.0 * s, cy + 5.0 * s), (cx - 3.5 * s, cy)], col, f);
+        } else {
+            self.poly(&[(cx - 3.0 * s, cy - 5.0 * s), (cx - 3.0 * s, cy + 5.0 * s), (cx + 3.5 * s, cy)], col, f);
+        }
+    }
+
+    fn bell(&mut self, cx: f32, cy: f32, s: f32, col: Rgb, f: f32) {
+        self.circle(cx, cy - 2.0 * s, 5.0 * s, col, f);
+        self.poly(
+            &[(cx - 5.0 * s, cy - 2.0 * s), (cx + 5.0 * s, cy - 2.0 * s), (cx + 7.0 * s, cy + 4.0 * s), (cx - 7.0 * s, cy + 4.0 * s)],
+            col,
+            f,
+        );
+        self.circle(cx, cy + 6.0 * s, 1.8 * s, col, f);
+    }
+
+    /// Marco fino estilo NieR con marcas en las esquinas.
+    fn frame(&mut self, x0: f32, y0: f32, w: f32, h: f32, s: f32) {
+        let th = self.th;
+        let (fx, fy, fw, fh) = (x0 + 6.0 * s, y0 + 6.0 * s, w - 12.0 * s, h - 12.0 * s);
+        if fw < 80.0 * s || fh < 40.0 * s {
+            return;
+        }
+        self.rrect(fx, fy, fw, fh, 1.0 * s, th.fg, 0.4);
+        self.rrect(fx + 1.0 * s, fy + 1.0 * s, fw - 2.0 * s, fh - 2.0 * s, 0.5 * s, th.bg, 1.0);
+        let q = 3.0 * s;
+        for (px, py) in [(fx, fy), (fx + fw - q, fy), (fx, fy + fh - q), (fx + fw - q, fy + fh - q)] {
+            self.rrect(px, py, q, q, 0.5 * s, th.fg, 0.75);
+        }
+    }
+
+    fn tab_icon(&mut self, page: Page, cx: f32, cy: f32, s: f32, col: Rgb, f: f32) {
+        let bg = self.th.bg;
+        match page {
+            Page::Music => {
+                self.circle(cx - 3.0 * s, cy + 4.5 * s, 3.2 * s, col, f);
+                self.rrect(cx - 0.2 * s, cy - 7.0 * s, 1.7 * s, 12.0 * s, 0.8 * s, col, f);
+                self.poly(&[(cx + 1.4 * s, cy - 7.0 * s), (cx + 6.0 * s, cy - 4.0 * s), (cx + 1.4 * s, cy - 2.0 * s)], col, f);
+            }
+            Page::Lyrics => {
+                self.rrect(cx - 7.0 * s, cy - 5.5 * s, 14.0 * s, 2.0 * s, 1.0 * s, col, f);
+                self.rrect(cx - 7.0 * s, cy - 1.0 * s, 10.0 * s, 2.0 * s, 1.0 * s, col, f);
+                self.rrect(cx - 7.0 * s, cy + 3.5 * s, 12.0 * s, 2.0 * s, 1.0 * s, col, f);
+            }
+            Page::Clock => self.clock_icon(cx, cy, 7.0 * s, s, col, f),
+            Page::Calendar => {
+                self.rrect(cx - 7.0 * s, cy - 6.0 * s, 14.0 * s, 13.0 * s, 2.5 * s, col, f);
+                self.rrect(cx - 5.5 * s, cy - 2.5 * s, 11.0 * s, 8.5 * s, 1.2 * s, bg, f);
+                self.rrect(cx - 3.8 * s, cy - 8.0 * s, 1.7 * s, 4.0 * s, 0.8 * s, col, f);
+                self.rrect(cx + 2.1 * s, cy - 8.0 * s, 1.7 * s, 4.0 * s, 0.8 * s, col, f);
+                self.circle(cx - 2.2 * s, cy + 1.8 * s, 1.1 * s, col, f);
+                self.circle(cx + 2.2 * s, cy + 1.8 * s, 1.1 * s, col, f);
+            }
+            Page::Timer => {
+                self.poly(&[(cx - 5.0 * s, cy - 6.0 * s), (cx + 5.0 * s, cy - 6.0 * s), (cx, cy)], col, f);
+                self.poly(&[(cx - 5.0 * s, cy + 6.0 * s), (cx + 5.0 * s, cy + 6.0 * s), (cx, cy)], col, f);
+                self.rrect(cx - 6.5 * s, cy - 8.0 * s, 13.0 * s, 1.8 * s, 0.9 * s, col, f);
+                self.rrect(cx - 6.5 * s, cy + 6.2 * s, 13.0 * s, 1.8 * s, 0.9 * s, col, f);
+            }
+            Page::Stopwatch => {
+                self.circle(cx, cy + 1.0 * s, 6.5 * s, col, f);
+                self.circle(cx, cy + 1.0 * s, 4.8 * s, bg, f);
+                self.rrect(cx - 1.5 * s, cy - 8.5 * s, 3.0 * s, 2.2 * s, 0.8 * s, col, f);
+                self.rrect(cx - 0.7 * s, cy - 3.0 * s, 1.4 * s, 4.5 * s, 0.7 * s, col, f);
+            }
+            Page::Calc => {
+                self.rrect(cx - 6.0 * s, cy - 7.0 * s, 12.0 * s, 14.0 * s, 2.5 * s, col, f);
+                self.rrect(cx - 4.0 * s, cy - 5.0 * s, 8.0 * s, 3.0 * s, 1.0 * s, bg, f);
+                for (dx, dy) in [(-2.5f32, 0.5f32), (2.5, 0.5), (-2.5, 4.0), (2.5, 4.0)] {
+                    self.circle(cx + dx * s, cy + dy * s, 1.1 * s, bg, f);
+                }
+            }
+            Page::Todo => {
+                self.rrect(cx - 6.5 * s, cy - 6.5 * s, 13.0 * s, 13.0 * s, 3.0 * s, col, f);
+                self.rrect(cx - 5.0 * s, cy - 5.0 * s, 10.0 * s, 10.0 * s, 2.0 * s, bg, f);
+                self.line(cx - 3.2 * s, cy + 0.2 * s, cx - 1.0 * s, cy + 2.6 * s, 1.7 * s, col, f);
+                self.line(cx - 1.0 * s, cy + 2.6 * s, cx + 3.6 * s, cy - 2.6 * s, 1.7 * s, col, f);
+            }
+            Page::Settings => {
+                for (i, kx) in [-3.0f32, 3.5, -1.0].iter().enumerate() {
+                    let y = cy + (i as f32 - 1.0) * 4.6 * s;
+                    self.rrect(cx - 7.0 * s, y - 0.8 * s, 14.0 * s, 1.6 * s, 0.8 * s, col, f);
+                    self.circle(cx + kx * s, y, 2.6 * s, col, f);
+                    self.circle(cx + kx * s, y, 1.1 * s, bg, f);
+                }
+            }
+        }
+    }
+}
+
+
 // ------------------------------------------------------------ app: logica
+
+fn open_notif() {
+    // Win+N abre el centro de notificaciones (Windows 11)
+    unsafe {
+        keybd_event(0x5B, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(0x4E, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(0x4E, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(0x5B, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
 
 impl App {
     fn feat(&self, i: usize) -> bool {
         self.features[i]
     }
 
+    fn notch(&self) -> bool {
+        self.cfg.style == 1
+    }
+
+    fn top(&self) -> f32 {
+        if self.notch() {
+            0.0
+        } else {
+            TOP * self.s
+        }
+    }
+
+    fn rad(&self, h: f32) -> f32 {
+        if self.th.sharp {
+            2.0 * self.s
+        } else {
+            h / 2.0
+        }
+    }
+
     fn page_enabled(&self, p: Page) -> bool {
         match p {
             Page::Music => self.feat(F_MUSIC),
+            Page::Lyrics => self.feat(F_LYRICS) && self.feat(F_MUSIC),
             Page::Clock => self.feat(F_CLOCK),
+            Page::Calendar => self.feat(F_CALENDAR),
             Page::Timer => self.feat(F_TIMER),
             Page::Stopwatch => self.feat(F_STOPWATCH),
             Page::Calc => self.feat(F_CALC),
+            Page::Todo => self.feat(F_TODO),
             Page::Settings => true,
         }
     }
@@ -1019,7 +1601,7 @@ impl App {
         if self.feat(F_MUSIC) && m.has {
             return Page::Music;
         }
-        for p in [Page::Clock, Page::Music, Page::Timer, Page::Stopwatch, Page::Calc] {
+        for p in [Page::Clock, Page::Music, Page::Calendar, Page::Timer, Page::Stopwatch, Page::Calc, Page::Todo] {
             if self.page_enabled(p) {
                 return p;
             }
@@ -1069,8 +1651,11 @@ impl App {
         if self.hidden {
             return false;
         }
-        let m = self.media.lock().unwrap();
-        let vis = m.has && m.playing && self.feat(F_VIS);
+        let (has, playing) = {
+            let m = self.media.lock().unwrap();
+            (m.has, m.playing)
+        };
+        let vis = has && playing && self.feat(F_VIS);
         let sw = self.sw_start.is_some();
         match self.mode {
             Mode::Collapsed => {
@@ -1079,12 +1664,13 @@ impl App {
                 } else if sw {
                     true
                 } else {
-                    m.has && vis
+                    vis
                 }
             }
             Mode::Expanded => match self.page {
                 Page::Music => vis,
                 Page::Stopwatch => sw,
+                Page::Lyrics => has && playing && self.lyrics.lock().unwrap().state == 2,
                 _ => false,
             },
             Mode::Toast => false,
@@ -1097,16 +1683,23 @@ impl App {
             Mode::Expanded => match self.page {
                 Page::Music => {
                     if m.has {
-                        (420.0, 158.0)
+                        (EW, 158.0)
                     } else {
-                        (420.0, 100.0)
+                        (EW, 100.0)
                     }
                 }
-                Page::Clock => (420.0, 128.0),
-                Page::Timer => (420.0, 156.0),
-                Page::Stopwatch => (420.0, 150.0),
-                Page::Calc => (420.0, 304.0),
-                Page::Settings => (420.0, 224.0),
+                Page::Lyrics => (EW, 150.0),
+                Page::Clock => (EW, 128.0),
+                Page::Calendar => (EW, 244.0),
+                Page::Timer => (EW, 156.0),
+                Page::Stopwatch => (EW, 150.0),
+                Page::Calc => (EW, 304.0),
+                Page::Todo => (EW, 230.0),
+                Page::Settings => match self.settings_tab {
+                    0 => (EW, 242.0),
+                    1 => (EW, 272.0),
+                    _ => (EW, 332.0),
+                },
             },
             Mode::Collapsed => match self.collapsed_view(m) {
                 0 | 1 => (132.0, 34.0),
@@ -1119,9 +1712,10 @@ impl App {
 
     fn pill_rect(&self) -> (f32, f32, f32, f32) {
         let s = self.s;
+        let top = self.top();
         let w = (self.cur[0] * s).clamp(1.0, self.pw as f32);
-        let h = (self.cur[1] * s).clamp(1.0, self.ph as f32 - TOP * s);
-        ((self.pw as f32 - w) / 2.0, TOP * s, w, h)
+        let h = (self.cur[1] * s).clamp(1.0, self.ph as f32 - top);
+        ((self.pw as f32 - w) / 2.0, top, w, h)
     }
 
     fn start_anim(&mut self) {
@@ -1138,7 +1732,7 @@ impl App {
     fn refresh_mode(&mut self) {
         let new = if self.toast.is_some() {
             Mode::Toast
-        } else if self.hover || self.pinned {
+        } else if self.hover || self.pinned || self.editing {
             Mode::Expanded
         } else {
             Mode::Collapsed
@@ -1158,6 +1752,9 @@ impl App {
         }
         if new != Mode::Expanded {
             self.hover_act = None;
+        }
+        if new == Mode::Expanded && self.page == Page::Lyrics {
+            self.check_lyrics();
         }
         self.start_anim();
     }
@@ -1197,6 +1794,47 @@ impl App {
         }
     }
 
+    fn check_lyrics(&mut self) {
+        if !self.feat(F_LYRICS) {
+            return;
+        }
+        let m = self.media.lock().unwrap().clone();
+        if !m.has || m.title.is_empty() {
+            return;
+        }
+        let key = (m.artist.clone(), m.title.clone());
+        if key == self.lyr_key {
+            return;
+        }
+        self.lyr_key = key.clone();
+        *self.lyrics.lock().unwrap() = Lyrics { key: key.clone(), state: 1, ..Default::default() };
+        let ly = self.lyrics.clone();
+        let hv = self.hwnd.0 as isize;
+        let dur = m.dur;
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = RoInitialize(RO_INIT_MULTITHREADED);
+            }
+            let res = fetch_lyrics(&key.0, &key.1, dur);
+            {
+                let mut l = ly.lock().unwrap();
+                if l.key == key {
+                    match res {
+                        Some((lines, plain)) => {
+                            l.lines = lines;
+                            l.plain = plain;
+                            l.state = 2;
+                        }
+                        None => l.state = 3,
+                    }
+                }
+            }
+            unsafe {
+                let _ = PostMessageW(HWND(hv as _), WM_APP_MEDIA, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last).as_secs_f32().min(0.05);
@@ -1221,6 +1859,14 @@ impl App {
                 settled = false;
             }
         }
+        // opacidad (suavizada)
+        let kk = 1.0 - (-dt * 10.0).exp();
+        self.opacity += (self.opacity_target - self.opacity) * kk;
+        if (self.opacity_target - self.opacity).abs() > 0.004 {
+            settled = false;
+        } else {
+            self.opacity = self.opacity_target;
+        }
         self.fade = (self.fade + dt / 0.25).min(1.0);
         if self.fade < 1.0 {
             settled = false;
@@ -1235,10 +1881,44 @@ impl App {
     }
 
     fn vis_tick(&mut self) {
-        if !self.animating && self.live_visible() {
-            self.render();
-        } else if !self.live_visible() {
+        if self.live_visible() {
+            if !self.animating {
+                self.render();
+            }
+        } else {
             self.update_vis_timer();
+        }
+    }
+
+    /// Opacidad segun la distancia del cursor a la isla.
+    fn prox_tick(&mut self) {
+        if self.hidden {
+            return;
+        }
+        let target = if !self.feat(F_PROX) {
+            1.0
+        } else {
+            let mut p = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut p);
+            }
+            let (x0, y0, w, h) = self.pill_rect();
+            let (l, t) = (self.pos.x as f32 + x0, self.pos.y as f32 + y0);
+            let (px, py) = (p.x as f32, p.y as f32);
+            let dx = (l - px).max(px - (l + w)).max(0.0);
+            let dy = (t - py).max(py - (t + h)).max(0.0);
+            let dist = (dx * dx + dy * dy).sqrt();
+            let near = self.hover || self.pinned || self.editing || self.toast.is_some() || self.drag.is_some();
+            if near {
+                1.0
+            } else {
+                let k = smooth(dist / self.cfg.prox_dist);
+                1.0 + (self.cfg.op_min - 1.0) * k
+            }
+        };
+        if (target - self.opacity_target).abs() > 0.01 {
+            self.opacity_target = target;
+            self.start_anim();
         }
     }
 
@@ -1330,29 +2010,117 @@ impl App {
         }
     }
 
-    // ---- entrada
+    // ---- edicion de texto (tareas / calculadora)
 
-    fn grab_focus(&mut self) {
+    fn begin_edit(&mut self) {
+        if self.editing {
+            return;
+        }
+        self.editing = true;
         unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE.0 as isize));
             let fg = GetForegroundWindow();
             if fg != self.hwnd {
                 self.prev_fg = fg.0 as isize;
-                let _ = SetForegroundWindow(self.hwnd);
-                let _ = SetFocus(self.hwnd);
+            }
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(self.hwnd);
+        }
+        self.refresh_mode();
+    }
+
+    fn end_edit(&mut self, restore: bool) {
+        if !self.editing {
+            return;
+        }
+        self.editing = false;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE.0 as isize);
+            if restore && self.prev_fg != 0 && GetForegroundWindow() == self.hwnd {
+                let _ = SetForegroundWindow(HWND(self.prev_fg as _));
+            }
+        }
+        self.prev_fg = 0;
+        self.refresh_mode();
+        self.update_vis_timer();
+        if !self.animating {
+            self.render();
+        }
+    }
+
+    // ---- posicion
+
+    fn clamp_pos(&self, p: POINT) -> POINT {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let half = self.pw / 2;
+            let m = (60.0 * self.s) as i32;
+            POINT {
+                x: p.x.clamp(vx - half + m, vx + vw - half - m),
+                y: p.y.clamp(vy - (TOP * self.s) as i32, vy + vh - (80.0 * self.s) as i32),
             }
         }
     }
 
-    fn restore_focus(&mut self) {
-        if self.prev_fg != 0 && !self.pinned {
-            unsafe {
-                if GetForegroundWindow() == self.hwnd {
-                    let _ = SetForegroundWindow(HWND(self.prev_fg as _));
-                }
-            }
-            self.prev_fg = 0;
+    fn apply_pos(&mut self) {
+        let p = if self.notch() {
+            self.home
+        } else {
+            self.clamp_pos(POINT { x: self.home.x + self.cfg.dx, y: self.home.y + self.cfg.dy })
+        };
+        self.pos = p;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, HWND::default(), p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+
+    fn drag_move(&mut self) {
+        let mut cur = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cur);
+        }
+        let (c0, p0, moved) = match &self.drag {
+            Some(d) => (d.c0, d.p0, d.moved),
+            None => return,
+        };
+        let (dx, dy) = (cur.x - c0.x, cur.y - c0.y);
+        if !moved && dx.abs() + dy.abs() < 4 {
+            return;
+        }
+        if let Some(d) = self.drag.as_mut() {
+            d.moved = true;
+        }
+        let p = self.clamp_pos(POINT { x: p0.x + dx, y: p0.y + dy });
+        self.pos = p;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, HWND::default(), p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    fn finish_drag(&mut self) {
+        let s = self.s;
+        let mut p = self.pos;
+        if (p.x - self.home.x).abs() < (24.0 * s) as i32 {
+            p.x = self.home.x;
+        }
+        if (p.y - self.home.y).abs() < (16.0 * s) as i32 {
+            p.y = self.home.y;
+        }
+        self.pos = p;
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, HWND::default(), p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        self.cfg.dx = p.x - self.home.x;
+        self.cfg.dy = p.y - self.home.y;
+        save_config(&self.features, &self.cfg);
+    }
+
+    // ---- entrada
 
     fn set_hover(&mut self, h: bool) {
         if h == self.hover {
@@ -1360,21 +2128,29 @@ impl App {
         }
         self.hover = h;
         if h {
-            if !self.pinned && self.collapsed_at.elapsed() > Duration::from_secs(8) {
+            if !self.pinned && !self.editing && self.collapsed_at.elapsed() > Duration::from_secs(8) {
                 let m = self.media.lock().unwrap().clone();
                 self.page = self.home_page(&m);
             }
         } else {
             self.collapsed_at = Instant::now();
             self.hover_act = None;
-            self.restore_focus();
         }
         self.ensure_page();
         self.refresh_mode();
         self.update_vis_timer();
+        self.prox_tick();
     }
 
     fn on_move(&mut self, x: i32, y: i32) {
+        if let Some(id) = self.slider_drag {
+            self.slider_set(id, x as f32);
+            return;
+        }
+        if self.drag.is_some() {
+            self.drag_move();
+            return;
+        }
         if !self.tracking {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1405,7 +2181,9 @@ impl App {
 
     fn on_leave(&mut self) {
         self.tracking = false;
-        self.set_hover(false);
+        if self.slider_drag.is_none() && self.drag.is_none() {
+            self.set_hover(false);
+        }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Widget> {
@@ -1415,11 +2193,78 @@ impl App {
         let m = self.media.lock().unwrap().clone();
         let (x, y) = (x as f32, y as f32);
         for wd in self.layout(self.mode, self.page, &m) {
+            if wd.act == Act::None {
+                continue;
+            }
             if x >= wd.x && x < wd.x + wd.w && y >= wd.y && y < wd.y + wd.h {
                 return Some(wd);
             }
         }
         None
+    }
+
+    fn on_down(&mut self, x: i32, y: i32) {
+        if let Some(wd) = self.hit(x, y) {
+            if let Act::Slider(id) = wd.act {
+                self.slider_drag = Some(id);
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+                self.slider_set(id, x as f32);
+            }
+            return;
+        }
+        if self.feat(F_DRAG) && !self.notch() {
+            let (x0, y0, w, h) = self.pill_rect();
+            let (fx, fy) = (x as f32, y as f32);
+            if fx >= x0 && fx <= x0 + w && fy >= y0 && fy <= y0 + h {
+                let mut p = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut p);
+                    SetCapture(self.hwnd);
+                }
+                self.drag = Some(DragState { c0: p, p0: self.pos, moved: false });
+            }
+        }
+    }
+
+    fn on_up(&mut self, x: i32, y: i32) {
+        if self.slider_drag.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            save_config(&self.features, &self.cfg);
+            return;
+        }
+        if let Some(d) = self.drag.take() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            if d.moved {
+                self.finish_drag();
+            }
+            return;
+        }
+        self.click(x, y);
+    }
+
+    fn slider_set(&mut self, id: u8, x: f32) {
+        let m = self.media.lock().unwrap().clone();
+        let s = self.s;
+        let found = self.layout(self.mode, self.page, &m).into_iter().find(|w| w.act == Act::Slider(id));
+        if let Some(wd) = found {
+            let (tx, tw) = (wd.x + 8.0 * s, wd.w - 16.0 * s);
+            let frac = ((x - tx) / tw).clamp(0.0, 1.0);
+            if id == 0 {
+                self.cfg.op_min = 0.1 + 0.8 * frac;
+            } else {
+                self.cfg.prox_dist = 100.0 + 500.0 * frac;
+            }
+            self.prox_tick();
+            if !self.animating {
+                self.render();
+            }
+        }
     }
 
     fn click(&mut self, x: i32, y: i32) {
@@ -1436,16 +2281,64 @@ impl App {
         }
     }
 
+    fn on_wheel(&mut self, delta: i32) {
+        if self.mode == Mode::Expanded && self.page == Page::Todo {
+            let max = self.todos.len().saturating_sub(5);
+            if delta > 0 {
+                self.todo_scroll = self.todo_scroll.saturating_sub(1);
+            } else {
+                self.todo_scroll = (self.todo_scroll + 1).min(max);
+            }
+            if !self.animating {
+                self.render();
+            }
+            return;
+        }
+        if self.hover && self.feat(F_VOLUME) && delta != 0 {
+            let n = (delta.abs() / 120).clamp(1, 5);
+            key_tap(if delta > 0 { 0xAF } else { 0xAE }, n);
+        }
+    }
+
+    fn rebuild_fonts(&mut self) {
+        unsafe {
+            for f in [self.font_main, self.font_small, self.font_big, self.font_strike] {
+                let _ = DeleteObject(HGDIOBJ(f.0));
+            }
+        }
+        let face: &str = if self.cfg.font == 0 { self.th.font } else { FONTS[self.cfg.font as usize] };
+        let s = self.s;
+        self.font_main = make_font(face, (15.0 * s) as i32, 600, false);
+        self.font_small = make_font(face, (13.0 * s) as i32, 400, false);
+        self.font_big = make_font(face, (30.0 * s) as i32, 300, false);
+        self.font_strike = make_font(face, (13.0 * s) as i32, 400, true);
+    }
+
+    fn add_todo(&mut self) {
+        let t = self.todo_input.trim().to_string();
+        if !t.is_empty() {
+            self.todos.insert(0, (false, t));
+            self.todo_input.clear();
+            self.todo_scroll = 0;
+            save_todos(&self.todos);
+        }
+    }
+
     fn do_act(&mut self, act: Act) {
         let now = Instant::now();
         match act {
-            Act::Tab(p) => self.page = p,
+            Act::None | Act::Slider(_) => return,
+            Act::Tab(p) => {
+                if self.editing {
+                    self.end_edit(true);
+                }
+                self.page = p;
+            }
             Act::Pin => {
                 self.pinned = !self.pinned;
-                if !self.pinned {
-                    self.restore_focus();
-                }
+                self.prox_tick();
             }
+            Act::Notif => open_notif(),
             Act::Prev => media_cmd(Cmd::Prev),
             Act::Toggle => media_cmd(Cmd::Toggle),
             Act::Next => media_cmd(Cmd::Next),
@@ -1509,7 +2402,7 @@ impl App {
                 self.laps.clear();
             }
             Act::Key(i) => {
-                self.grab_focus();
+                self.begin_edit();
                 self.calc_press(KEYS[i].0);
             }
             Act::Feature(i) => {
@@ -1519,6 +2412,74 @@ impl App {
             Act::Autostart => {
                 set_autostart(!self.autostart);
                 self.autostart = autostart_enabled();
+            }
+            Act::Cycle(id, dir) => {
+                let d = dir as i32;
+                match id {
+                    0 => {
+                        let n = THEMES.len() as i32;
+                        self.cfg.theme = ((self.cfg.theme as i32 + d).rem_euclid(n)) as u8;
+                        self.th = theme_of(self.cfg.theme);
+                        self.rebuild_fonts();
+                    }
+                    1 => {
+                        self.cfg.style = ((self.cfg.style as i32 + d).rem_euclid(2)) as u8;
+                        self.apply_pos();
+                    }
+                    _ => {
+                        let n = FONTS.len() as i32;
+                        self.cfg.font = ((self.cfg.font as i32 + d).rem_euclid(n)) as u8;
+                        self.rebuild_fonts();
+                    }
+                }
+                save_config(&self.features, &self.cfg);
+            }
+            Act::SubTab(i) => self.settings_tab = i,
+            Act::CalPrev => {
+                if self.cal_month == 1 {
+                    self.cal_month = 12;
+                    self.cal_year -= 1;
+                } else {
+                    self.cal_month -= 1;
+                }
+            }
+            Act::CalNext => {
+                if self.cal_month == 12 {
+                    self.cal_month = 1;
+                    self.cal_year += 1;
+                } else {
+                    self.cal_month += 1;
+                }
+            }
+            Act::CalToday => {
+                let st = unsafe { GetLocalTime() };
+                self.cal_year = st.wYear as i32;
+                self.cal_month = st.wMonth as u32;
+            }
+            Act::TodoToggle(i) => {
+                if i < self.todos.len() {
+                    self.todos[i].0 = !self.todos[i].0;
+                    save_todos(&self.todos);
+                }
+            }
+            Act::TodoDel(i) => {
+                if i < self.todos.len() {
+                    self.todos.remove(i);
+                    let max = self.todos.len().saturating_sub(5);
+                    self.todo_scroll = self.todo_scroll.min(max);
+                    save_todos(&self.todos);
+                }
+            }
+            Act::TodoInput => self.begin_edit(),
+            Act::TodoAdd => {
+                self.add_todo();
+                self.begin_edit();
+            }
+            Act::ResetPos => {
+                self.cfg.dx = 0;
+                self.cfg.dy = 0;
+                self.apply_pos();
+                save_config(&self.features, &self.cfg);
             }
         }
         self.changed();
@@ -1549,10 +2510,12 @@ impl App {
             }
             F_CALC => {
                 if !on {
-                    self.calc_expr.clear();
-                    self.calc_prev.clear();
-                    self.calc_done = false;
-                    self.calc_err = false;
+                    self.calc_clear();
+                }
+            }
+            F_TODO => {
+                if !on {
+                    self.end_edit(true);
                 }
             }
             F_FULLSCREEN => {
@@ -1563,9 +2526,23 @@ impl App {
                     }
                 }
             }
+            F_PROX => unsafe {
+                if on && !self.prox_on {
+                    SetTimer(self.hwnd, T_PROX, 150, None);
+                    self.prox_on = true;
+                    self.prox_tick();
+                } else if !on {
+                    if self.prox_on {
+                        let _ = KillTimer(self.hwnd, T_PROX);
+                        self.prox_on = false;
+                    }
+                    self.opacity_target = 1.0;
+                    self.start_anim();
+                }
+            },
             _ => {}
         }
-        save_features(&self.features);
+        save_config(&self.features, &self.cfg);
         self.changed();
     }
 
@@ -1582,6 +2559,12 @@ impl App {
                 self.page = Page::Settings;
                 self.pinned = true;
                 self.changed();
+            }
+            150 => {
+                self.cfg.dx = 0;
+                self.cfg.dy = 0;
+                self.apply_pos();
+                save_config(&self.features, &self.cfg);
             }
             200..=299 => {
                 let i = (id - 200) as usize;
@@ -1629,60 +2612,90 @@ impl App {
                 }
             }
             _ => {
-                if let Some(c) = key_char(k) {
+                if let Some(ch) = key_char(k) {
                     if self.calc_err {
                         self.calc_clear();
                     }
                     if self.calc_done {
-                        if c.is_ascii_digit() || c == '.' || c == '(' {
+                        if ch.is_ascii_digit() || ch == '.' || ch == '(' {
                             self.calc_expr.clear();
                             self.calc_prev.clear();
                         }
                         self.calc_done = false;
                     }
                     if self.calc_expr.len() < 40 {
-                        self.calc_expr.push(c);
+                        self.calc_expr.push(ch);
                     }
                 }
             }
         }
     }
 
-    fn on_char(&mut self, c: char) {
-        if self.mode != Mode::Expanded || self.page != Page::Calc {
+    fn on_char(&mut self, ch: char) {
+        if self.mode != Mode::Expanded {
             return;
         }
-        let k = match c {
-            '0' => "0",
-            '1' => "1",
-            '2' => "2",
-            '3' => "3",
-            '4' => "4",
-            '5' => "5",
-            '6' => "6",
-            '7' => "7",
-            '8' => "8",
-            '9' => "9",
-            '.' | ',' => ".",
-            '+' => "+",
-            '-' => "−",
-            '*' | 'x' | 'X' => "×",
-            '/' => "÷",
-            '(' => "(",
-            ')' => ")",
-            '=' | '\r' => "=",
-            '\u{8}' => "←",
-            '\u{1b}' | 'c' | 'C' => "AC",
+        match self.page {
+            Page::Todo => {
+                if !self.editing {
+                    return;
+                }
+                match ch {
+                    '\r' => self.add_todo(),
+                    '\u{8}' => {
+                        self.todo_input.pop();
+                    }
+                    '\u{1b}' => {
+                        self.end_edit(true);
+                        return;
+                    }
+                    c2 if !c2.is_control() => {
+                        if self.todo_input.chars().count() < 80 {
+                            self.todo_input.push(c2);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Page::Calc => {
+                let k = match ch {
+                    '0' => "0",
+                    '1' => "1",
+                    '2' => "2",
+                    '3' => "3",
+                    '4' => "4",
+                    '5' => "5",
+                    '6' => "6",
+                    '7' => "7",
+                    '8' => "8",
+                    '9' => "9",
+                    '.' | ',' => ".",
+                    '+' => "+",
+                    '-' => "−",
+                    '*' | 'x' | 'X' => "×",
+                    '/' => "÷",
+                    '(' => "(",
+                    ')' => ")",
+                    '=' | '\r' => "=",
+                    '\u{8}' => "←",
+                    '\u{1b}' | 'c' | 'C' => "AC",
+                    _ => return,
+                };
+                self.calc_press(k);
+            }
             _ => return,
-        };
-        self.calc_press(k);
+        }
         if !self.animating {
             self.render();
         }
     }
+}
 
-    // ---- geometria de los controles (la usan el dibujo y el mouse)
 
+// ------------------------------------------------------------ app: geometria y dibujo
+
+impl App {
+    /// Geometria de los controles; la usan el dibujo y el mouse.
     fn layout(&self, mode: Mode, page: Page, m: &Media) -> Vec<Widget> {
         let mut v: Vec<Widget> = Vec::new();
         if mode != Mode::Expanded {
@@ -1690,124 +2703,172 @@ impl App {
         }
         let s = self.s;
         let cx = self.pw as f32 / 2.0;
-        let y0 = TOP * s;
-        let mk = |x: f32, y: f32, w: f32, h: f32, kind: WKind, act: Act, label: &'static str, on: bool| Widget {
-            x,
-            y,
-            w,
-            h,
-            kind,
-            act,
-            label,
-            on,
-        };
+        let y0 = self.top();
+        let half = EW / 2.0;
 
-        // barra de pestañas
-        let all: [(Page, &'static str, f32); 5] = [
-            (Page::Music, "Música", 62.0),
-            (Page::Clock, "Reloj", 55.0),
-            (Page::Timer, "Timer", 55.0),
-            (Page::Stopwatch, "Crono", 55.0),
-            (Page::Calc, "Calc", 48.0),
+        // barra de pestañas (iconos; la activa muestra su nombre)
+        const TABS: [(Page, &str, f32); 9] = [
+            (Page::Music, "Música", 46.0),
+            (Page::Lyrics, "Letras", 42.0),
+            (Page::Clock, "Reloj", 36.0),
+            (Page::Calendar, "Cal.", 30.0),
+            (Page::Timer, "Timer", 38.0),
+            (Page::Stopwatch, "Crono", 40.0),
+            (Page::Calc, "Calc", 32.0),
+            (Page::Todo, "Tareas", 44.0),
+            (Page::Settings, "Ajustes", 48.0),
         ];
-        let mut items: Vec<(Page, &'static str, f32)> = Vec::new();
-        for t in all.iter() {
-            if self.page_enabled(t.0) {
-                items.push(*t);
+        let mut x = cx - (half - 16.0) * s;
+        for (p, l, lw) in TABS.iter() {
+            if !self.page_enabled(*p) {
+                continue;
             }
+            let sel = *p == page;
+            let wd = if sel { 28.0 + lw + 8.0 } else { 28.0 };
+            v.push(Widget::new(x, y0 + 8.0 * s, wd * s, 24.0 * s, WKind::Tab(*p), Act::Tab(*p), *l).on(sel));
+            x += (wd + 3.0) * s;
         }
-        items.push((Page::Settings, "Ajustes", 69.0));
-        let gap = 4.0;
-        let pin_w = 28.0;
-        let total: f32 = items.iter().map(|t| t.2).sum::<f32>() + gap * items.len() as f32 + pin_w;
-        let mut x = cx - total * s / 2.0;
-        for (p, l, wd) in items {
-            v.push(mk(x, y0 + 8.0 * s, wd * s, 24.0 * s, WKind::Tab, Act::Tab(p), l, p == page));
-            x += (wd + gap) * s;
+        v.push(Widget::new(cx + (half - 40.0) * s, y0 + 8.0 * s, 24.0 * s, 24.0 * s, WKind::Pin, Act::Pin, "").on(self.pinned));
+        if self.feat(F_NOTIF) {
+            v.push(Widget::new(cx + (half - 68.0) * s, y0 + 8.0 * s, 24.0 * s, 24.0 * s, WKind::Bell, Act::Notif, ""));
         }
-        v.push(mk(x, y0 + 8.0 * s, pin_w * s, 24.0 * s, WKind::Pin, Act::Pin, "", self.pinned));
 
         match page {
             Page::Music => {
                 if m.has {
                     let yc = y0 + 134.0 * s;
-                    v.push(mk(cx - 84.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Prev), Act::Prev, "", false));
+                    v.push(Widget::new(cx - 84.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Prev), Act::Prev, ""));
                     let big = if m.playing { Icon::Pause } else { Icon::Play };
-                    v.push(mk(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::Toggle, "", false));
-                    v.push(mk(cx + 40.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Next), Act::Next, "", false));
-                    v.push(mk(cx - 156.0 * s, y0 + 98.0 * s, 312.0 * s, 20.0 * s, WKind::Bar, Act::Seek(0.0), "", false));
+                    v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::Toggle, ""));
+                    v.push(Widget::new(cx + 40.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Next), Act::Next, ""));
+                    v.push(Widget::new(cx - 156.0 * s, y0 + 98.0 * s, 312.0 * s, 20.0 * s, WKind::Bar, Act::Seek(0.0), ""));
                 }
+            }
+            Page::Calendar => {
+                v.push(Widget::new(cx - 150.0 * s, y0 + 40.0 * s, 28.0 * s, 24.0 * s, WKind::Arrow(-1), Act::CalPrev, ""));
+                v.push(Widget::new(cx + 118.0 * s, y0 + 40.0 * s, 28.0 * s, 24.0 * s, WKind::Arrow(1), Act::CalNext, ""));
+                v.push(Widget::new(cx + 158.0 * s, y0 + 41.0 * s, 48.0 * s, 22.0 * s, WKind::Pill, Act::CalToday, "Hoy"));
             }
             Page::Timer => {
                 let presets: [(&'static str, u64); 4] = [("1 min", 1), ("5 min", 5), ("10 min", 10), ("25 min", 25)];
                 for (i, (l, mins)) in presets.iter().enumerate() {
                     let px = cx - 128.0 * s + i as f32 * 66.0 * s;
-                    v.push(mk(px, y0 + 90.0 * s, 58.0 * s, 22.0 * s, WKind::Pill, Act::Preset(*mins), *l, false));
+                    v.push(Widget::new(px, y0 + 90.0 * s, 58.0 * s, 22.0 * s, WKind::Pill, Act::Preset(*mins), *l));
                 }
                 let yc = y0 + 132.0 * s;
-                v.push(mk(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerReset, "Reiniciar", false));
+                v.push(Widget::new(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerReset, "Reiniciar"));
                 let big = if self.timer_end.is_some() { Icon::Pause } else { Icon::Play };
-                v.push(mk(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::TimerToggle, "", false));
-                v.push(mk(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerAdd, "+1 min", false));
+                v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::TimerToggle, ""));
+                v.push(Widget::new(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerAdd, "+1 min"));
             }
             Page::Stopwatch => {
                 let yc = y0 + 124.0 * s;
-                v.push(mk(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwLap, "Vuelta", false));
+                v.push(Widget::new(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwLap, "Vuelta"));
                 let big = if self.sw_start.is_some() { Icon::Pause } else { Icon::Play };
-                v.push(mk(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::SwToggle, "", false));
-                v.push(mk(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwReset, "Reiniciar", false));
+                v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::SwToggle, ""));
+                v.push(Widget::new(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwReset, "Reiniciar"));
             }
             Page::Calc => {
                 for (i, (lab, cls)) in KEYS.iter().enumerate() {
-                    let (r, c) = ((i / 4) as f32, (i % 4) as f32);
-                    v.push(mk(
-                        cx - 168.0 * s + c * 86.0 * s,
+                    let (r, cc) = ((i / 4) as f32, (i % 4) as f32);
+                    v.push(Widget::new(
+                        cx - 168.0 * s + cc * 86.0 * s,
                         y0 + 96.0 * s + r * 40.0 * s,
                         78.0 * s,
                         32.0 * s,
                         WKind::Key(*cls),
                         Act::Key(i),
                         *lab,
-                        false,
                     ));
+                }
+            }
+            Page::Todo => {
+                let ix = cx - 196.0 * s;
+                v.push(Widget::new(ix, y0 + 40.0 * s, 354.0 * s, 26.0 * s, WKind::Input, Act::TodoInput, "").on(self.editing));
+                v.push(Widget::new(cx + 164.0 * s, y0 + 40.0 * s, 32.0 * s, 26.0 * s, WKind::Pill, Act::TodoAdd, "+"));
+                for k in 0..5usize {
+                    let i = self.todo_scroll + k;
+                    if i >= self.todos.len() {
+                        break;
+                    }
+                    let y = y0 + 74.0 * s + k as f32 * 28.0 * s;
+                    v.push(Widget::new(ix, y, 360.0 * s, 26.0 * s, WKind::Check, Act::TodoToggle(i), "").on(self.todos[i].0));
+                    v.push(Widget::new(cx + 168.0 * s, y, 28.0 * s, 26.0 * s, WKind::Del, Act::TodoDel(i), ""));
                 }
             }
             Page::Settings => {
-                for i in 0..=F_COUNT {
-                    let (label, act, on): (&'static str, Act, bool) = if i < F_COUNT {
-                        (FEATURES[i].1, Act::Feature(i), self.features[i])
-                    } else {
-                        ("Iniciar con Windows", Act::Autostart, self.autostart)
-                    };
-                    let (col, row) = ((i % 2) as f32, (i / 2) as f32);
-                    v.push(mk(
-                        cx - 194.0 * s + col * 200.0 * s,
-                        y0 + 44.0 * s + row * 28.0 * s,
-                        188.0 * s,
-                        26.0 * s,
-                        WKind::Toggle,
-                        act,
-                        label,
-                        on,
-                    ));
+                let chips: [(&'static str, f32); 3] = [("Funciones", 90.0), ("Apariencia", 90.0), ("Comportamiento", 118.0)];
+                let total: f32 = chips.iter().map(|c| c.1).sum::<f32>() + 12.0;
+                let mut x = cx - total * s / 2.0;
+                for (i, (l, wd)) in chips.iter().enumerate() {
+                    v.push(Widget::new(x, y0 + 40.0 * s, wd * s, 22.0 * s, WKind::Chip, Act::SubTab(i as u8), *l).on(self.settings_tab == i as u8));
+                    x += (wd + 6.0) * s;
+                }
+                let ry = y0 + 78.0 * s;
+                let (pitch, rh) = (30.0 * s, 26.0 * s);
+                let toggle = |v: &mut Vec<Widget>, row: f32, fi: usize| {
+                    v.push(Widget::new(cx - 200.0 * s, ry + row * pitch, 400.0 * s, rh, WKind::Toggle, Act::Feature(fi), FEATURES[fi].1).on(self.features[fi]));
+                };
+                let selector = |v: &mut Vec<Widget>, row: f32, id: u8, name: &'static str, val: &'static str| {
+                    let y = ry + row * pitch;
+                    v.push(Widget::new(cx - 200.0 * s, y, 180.0 * s, rh, WKind::Label, Act::None, name));
+                    v.push(Widget::new(cx - 10.0 * s, y + 2.0 * s, 22.0 * s, rh - 4.0 * s, WKind::Arrow(-1), Act::Cycle(id, -1), ""));
+                    v.push(Widget::new(cx + 14.0 * s, y, 158.0 * s, rh, WKind::Selector, Act::Cycle(id, 1), "").l2(val));
+                    v.push(Widget::new(cx + 174.0 * s, y + 2.0 * s, 22.0 * s, rh - 4.0 * s, WKind::Arrow(1), Act::Cycle(id, 1), ""));
+                };
+                match self.settings_tab {
+                    0 => {
+                        for (k, &fi) in FUNC_LIST.iter().enumerate() {
+                            let (col, row) = ((k % 2) as f32, (k / 2) as f32);
+                            v.push(
+                                Widget::new(cx - 208.0 * s + col * 212.0 * s, ry + row * pitch, 200.0 * s, rh, WKind::Toggle, Act::Feature(fi), FEATURES[fi].1)
+                                    .on(self.features[fi]),
+                            );
+                        }
+                    }
+                    1 => {
+                        const STYLES: [&str; 2] = ["Isla", "Notch"];
+                        selector(&mut v, 0.0, 0, "Tema", THEME_NAMES[self.cfg.theme as usize]);
+                        selector(&mut v, 1.0, 1, "Estilo", STYLES[self.cfg.style as usize]);
+                        selector(&mut v, 2.0, 2, "Fuente", FONTS[self.cfg.font as usize]);
+                        toggle(&mut v, 3.0, F_SHADOW);
+                        toggle(&mut v, 4.0, F_VIS);
+                        toggle(&mut v, 5.0, F_COVER);
+                    }
+                    _ => {
+                        toggle(&mut v, 0.0, F_DRAG);
+                        let y1 = ry + pitch;
+                        v.push(Widget::new(cx - 200.0 * s, y1, 180.0 * s, rh, WKind::Label, Act::None, "Posición de la isla"));
+                        v.push(Widget::new(cx + 86.0 * s, y1 + 1.0 * s, 110.0 * s, rh - 2.0 * s, WKind::Pill, Act::ResetPos, "Restablecer"));
+                        toggle(&mut v, 2.0, F_PROX);
+                        let y3 = ry + 3.0 * pitch;
+                        v.push(Widget::new(cx - 200.0 * s, y3, 160.0 * s, rh, WKind::Label, Act::None, "Opacidad mínima"));
+                        v.push(Widget::new(cx - 30.0 * s, y3, 172.0 * s, rh, WKind::Slider, Act::Slider(0), "").val((self.cfg.op_min - 0.1) / 0.8));
+                        let y4 = ry + 4.0 * pitch;
+                        v.push(Widget::new(cx - 200.0 * s, y4, 160.0 * s, rh, WKind::Label, Act::None, "Distancia"));
+                        v.push(Widget::new(cx - 30.0 * s, y4, 172.0 * s, rh, WKind::Slider, Act::Slider(1), "").val((self.cfg.prox_dist - 100.0) / 500.0));
+                        toggle(&mut v, 5.0, F_FULLSCREEN);
+                        toggle(&mut v, 6.0, F_VOLUME);
+                        let y7 = ry + 7.0 * pitch;
+                        v.push(
+                            Widget::new(cx - 200.0 * s, y7, 400.0 * s, rh, WKind::Toggle, Act::Autostart, "Iniciar con Windows").on(self.autostart),
+                        );
+                    }
                 }
             }
-            Page::Clock => {}
+            Page::Lyrics | Page::Clock => {}
         }
         v
     }
-}
 
-// ------------------------------------------------------------ app: dibujo
-
-impl App {
     #[allow(clippy::too_many_arguments)]
-    unsafe fn txt(&self, font: HFONT, s: &str, l: f32, t: f32, r: f32, b: f32, col: (u8, u8, u8), f: f32, fmt: DRAW_TEXT_FORMAT) {
+    unsafe fn txt(&self, font: HFONT, s: &str, l: f32, t: f32, r: f32, b: f32, col: Rgb, f: f32, fmt: DRAW_TEXT_FORMAT) {
         if s.is_empty() || f < 0.02 || r <= l {
             return;
         }
-        let c = |v: u8| (v as f32 * f) as u32;
-        SetTextColor(self.mem, COLORREF((c(col.2) << 16) | (c(col.1) << 8) | c(col.0)));
+        let bg = self.th.bg;
+        let mix = |c: f32, b0: f32| (b0 + (c - b0) * f).clamp(0.0, 255.0) as u32;
+        SetTextColor(self.mem, COLORREF((mix(col.2, bg.2) << 16) | (mix(col.1, bg.1) << 8) | mix(col.0, bg.0)));
         let mut rc = RECT { left: l.round() as i32, top: t.round() as i32, right: r.round() as i32, bottom: b.round() as i32 };
         let mut v: Vec<u16> = s.encode_utf16().collect();
         let old = SelectObject(self.mem, HGDIOBJ(font.0));
@@ -1817,63 +2878,128 @@ impl App {
 
     fn draw_widgets(&self, cv: &mut Canvas, wl: &[Widget], f: f32) {
         let s = self.s;
+        let th = self.th;
         for wd in wl {
-            let hov = self.hover_act == Some(wd.act);
+            let hov = wd.act != Act::None && self.hover_act == Some(wd.act);
             let (cx, cy) = (wd.x + wd.w / 2.0, wd.y + wd.h / 2.0);
             match wd.kind {
-                WKind::Tab => {
+                WKind::Tab(p) => {
                     if wd.on {
-                        cv.rrect(wd.x, wd.y, wd.w, wd.h, wd.h / 2.0, WHITE, 0.16 * f);
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.16 * f);
                     } else if hov {
-                        cv.rrect(wd.x, wd.y, wd.w, wd.h, wd.h / 2.0, WHITE, 0.07 * f);
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.07 * f);
                     }
+                    let col = if wd.on { th.fg } else { th.fg2 };
+                    cv.tab_icon(p, wd.x + 14.0 * s, cy, s, col, f);
                 }
                 WKind::Pin => {
                     if hov {
-                        cv.circle(cx, cy, 11.0 * s, WHITE, 0.08 * f);
+                        cv.circle(cx, cy, 11.0 * s, th.fg, 0.08 * f);
                     }
                     if wd.on {
-                        cv.circle(cx, cy, 5.0 * s, ORANGE, f);
+                        cv.circle(cx, cy, 5.0 * s, th.accent, f);
                     } else {
-                        cv.circle(cx, cy, 5.0 * s, (150.0, 150.0, 158.0), f);
-                        cv.circle(cx, cy, 3.2 * s, BLACK, f);
+                        cv.circle(cx, cy, 5.0 * s, th.fg2, f);
+                        cv.circle(cx, cy, 3.2 * s, th.bg, f);
                     }
                 }
+                WKind::Bell => {
+                    if hov {
+                        cv.circle(cx, cy, 11.0 * s, th.fg, 0.08 * f);
+                    }
+                    cv.bell(cx, cy, s, if hov { th.fg } else { th.fg2 }, f);
+                }
                 WKind::Pill => {
-                    let c = if hov { (86.0, 86.0, 94.0) } else { (62.0, 62.0, 70.0) };
-                    cv.rrect(wd.x, wd.y, wd.w, wd.h, wd.h / 2.0, c, f);
+                    let c2 = if hov { th.surface_hi } else { th.surface };
+                    cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), c2, f);
                 }
                 WKind::Key(cls) => {
                     let base = match cls {
-                        0 => (58.0, 58.0, 64.0),
-                        1 => (160.0, 160.0, 168.0),
-                        _ => ORANGE,
+                        0 => th.surface,
+                        1 => th.key_fn,
+                        _ => th.accent,
                     };
-                    let c = if hov {
+                    let c2 = if hov {
                         ((base.0 + 28.0).min(255.0), (base.1 + 28.0).min(255.0), (base.2 + 28.0).min(255.0))
                     } else {
                         base
                     };
-                    cv.rrect(wd.x, wd.y, wd.w, wd.h, 12.0 * s, c, f);
+                    let rr = if th.sharp { 2.0 * s } else { 12.0 * s };
+                    cv.rrect(wd.x, wd.y, wd.w, wd.h, rr, c2, f);
                 }
                 WKind::Toggle => {
                     if hov {
-                        cv.rrect(wd.x, wd.y, wd.w, wd.h, 8.0 * s, WHITE, 0.06 * f);
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, 8.0 * s, th.fg, 0.06 * f);
                     }
                     cv.switch(wd.x + wd.w - 40.0 * s, cy - 10.0 * s, s, wd.on, f);
                 }
                 WKind::Icon(ic) => {
                     if hov {
-                        cv.circle(cx, cy, 19.0 * s, WHITE, 0.14 * f);
+                        cv.circle(cx, cy, 19.0 * s, th.fg, 0.14 * f);
                     }
-                    cv.icon(ic, cx, cy, s, WHITE, f);
+                    cv.icon(ic, cx, cy, s, th.fg, f);
                 }
                 WKind::Big(ic) => {
-                    let bg = if hov { (225.0, 225.0, 228.0) } else { WHITE };
+                    let bg = if hov {
+                        ((th.big_bg.0 * 0.9), (th.big_bg.1 * 0.9), (th.big_bg.2 * 0.9))
+                    } else {
+                        th.big_bg
+                    };
                     cv.circle(cx, cy, 17.0 * s, bg, f);
-                    cv.icon(ic, cx, cy, s, BLACK, f);
+                    cv.icon(ic, cx, cy, s, th.big_fg, f);
                 }
-                WKind::Bar => {}
+                WKind::Chip => {
+                    if wd.on {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface_hi, f);
+                    } else if hov {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, f);
+                    }
+                }
+                WKind::Selector => {
+                    if hov {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.7 * f);
+                    }
+                }
+                WKind::Slider => {
+                    let (tx, tw) = (wd.x + 8.0 * s, wd.w - 16.0 * s);
+                    cv.rrect(tx, cy - 2.0 * s, tw, 4.0 * s, 2.0 * s, th.track, f);
+                    let len = tw * wd.val.clamp(0.0, 1.0);
+                    cv.rrect(tx, cy - 2.0 * s, len.max(0.5), 4.0 * s, 2.0 * s, th.accent, f);
+                    cv.circle(tx + len, cy, 6.5 * s, th.knob, f);
+                }
+                WKind::Arrow(d) => {
+                    cv.arrow(d, cx, cy, s, if hov { th.fg } else { th.fg2 }, f);
+                }
+                WKind::Check => {
+                    if hov {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.5 * f);
+                    }
+                    let (bx, by, bs) = (wd.x + 4.0 * s, cy - 8.0 * s, 16.0 * s);
+                    let rr = if th.sharp { 1.5 * s } else { 4.0 * s };
+                    if wd.on {
+                        cv.rrect(bx, by, bs, bs, rr, th.accent, f);
+                        cv.line(bx + 3.5 * s, by + 8.5 * s, bx + 6.8 * s, by + 12.0 * s, 2.0 * s, th.on_accent, f);
+                        cv.line(bx + 6.8 * s, by + 12.0 * s, bx + 12.8 * s, by + 4.5 * s, 2.0 * s, th.on_accent, f);
+                    } else {
+                        cv.rrect(bx, by, bs, bs, rr, th.fg2, f);
+                        cv.rrect(bx + 1.5 * s, by + 1.5 * s, bs - 3.0 * s, bs - 3.0 * s, rr * 0.6, th.bg, f);
+                    }
+                }
+                WKind::Del => {
+                    let col = if hov { th.accent } else { th.fg2 };
+                    cv.line(cx - 4.0 * s, cy - 4.0 * s, cx + 4.0 * s, cy + 4.0 * s, 1.6 * s, col, f);
+                    cv.line(cx - 4.0 * s, cy + 4.0 * s, cx + 4.0 * s, cy - 4.0 * s, 1.6 * s, col, f);
+                }
+                WKind::Input => {
+                    let rr = self.rad(wd.h);
+                    if wd.on {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, rr, th.accent, f);
+                        cv.rrect(wd.x + 1.5 * s, wd.y + 1.5 * s, wd.w - 3.0 * s, wd.h - 3.0 * s, rr * 0.8, th.surface, f);
+                    } else {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, rr, th.surface, f);
+                    }
+                }
+                WKind::Bar | WKind::Label => {}
             }
         }
     }
@@ -1881,24 +3007,25 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn draw_software(&self, cv: &mut Canvas, m: &Media, mode: Mode, page: Page, wl: &[Widget], x0: f32, y0: f32, w: f32, h: f32, f: f32) {
         let s = self.s;
+        let th = self.th;
         let t = self.t0.elapsed().as_secs_f32();
         let cxm = self.pw as f32 / 2.0;
-        let accent = m.cover.as_ref().map(|c| c.accent).unwrap_or(WHITE);
+        let acc = m.cover.as_ref().map(|c| c.accent).unwrap_or(th.fg);
         let vis = self.feat(F_VIS);
         let cover_or_placeholder = |cv: &mut Canvas, x: f32, y: f32, size: f32, r: f32| match &m.cover {
             Some(c) => cv.cover(c, x, y, size, r, f),
-            None => cv.rrect(x, y, size, size, r, (52.0, 52.0, 58.0), f),
+            None => cv.rrect(x, y, size, size, r, th.surface, f),
         };
 
         match mode {
             Mode::Collapsed => match self.collapsed_view(m) {
-                0 => cv.clock_icon(x0 + 21.0 * s, y0 + h / 2.0, 8.0 * s, s, ORANGE, f),
-                1 => cv.clock_icon(x0 + 21.0 * s, y0 + h / 2.0, 8.0 * s, s, GREEN, f),
+                0 => cv.clock_icon(x0 + 21.0 * s, y0 + h / 2.0, 8.0 * s, s, th.accent, f),
+                1 => cv.clock_icon(x0 + 21.0 * s, y0 + h / 2.0, 8.0 * s, s, th.good, f),
                 2 => {
                     let size = 22.0 * s;
                     cover_or_placeholder(cv, x0 + 8.0 * s, y0 + (h - size) / 2.0, size, 6.0 * s);
                     if vis {
-                        cv.bars(x0 + w - 14.0 * s - 19.5 * s, y0 + h / 2.0, s, t, m.playing, accent, f);
+                        cv.bars(x0 + w - 14.0 * s - 19.5 * s, y0 + h / 2.0, s, t, m.playing, acc, f);
                     }
                 }
                 _ => {}
@@ -1910,22 +3037,36 @@ impl App {
                         if m.has {
                             cover_or_placeholder(cv, cxm - 194.0 * s, y0 + 42.0 * s, 56.0 * s, 11.0 * s);
                             if vis {
-                                cv.bars(cxm + 174.5 * s, y0 + 56.0 * s, s, t, m.playing, accent, f);
+                                cv.bars(cxm + 174.5 * s, y0 + 56.0 * s, s, t, m.playing, acc, f);
                             }
                             let (bx0, bx1) = (cxm - 148.0 * s, cxm + 148.0 * s);
                             let yc = y0 + 108.0 * s;
-                            cv.rrect(bx0, yc - 2.0 * s, bx1 - bx0, 4.0 * s, 2.0 * s, (70.0, 70.0, 78.0), f);
+                            cv.rrect(bx0, yc - 2.0 * s, bx1 - bx0, 4.0 * s, 2.0 * s, th.track, f);
                             if m.dur > 0.0 {
                                 let frac = (m.cur_pos() / m.dur).clamp(0.0, 1.0) as f32;
                                 let len = (bx1 - bx0) * frac;
-                                cv.rrect(bx0, yc - 2.0 * s, len.max(0.5), 4.0 * s, 2.0 * s, accent, f);
-                                cv.circle(bx0 + len, yc, 4.5 * s, WHITE, f);
+                                cv.rrect(bx0, yc - 2.0 * s, len.max(0.5), 4.0 * s, 2.0 * s, acc, f);
+                                cv.circle(bx0 + len, yc, 4.5 * s, th.knob, f);
                             }
                         }
                     }
                     Page::Clock => {
                         if self.batt.has {
                             cv.battery(cxm - 34.0 * s, y0 + 106.0 * s, s, self.batt, f);
+                        }
+                    }
+                    Page::Calendar => {
+                        let st = unsafe { GetLocalTime() };
+                        if st.wYear as i32 == self.cal_year && st.wMonth as u32 == self.cal_month {
+                            let first = weekday_mon0(self.cal_year, self.cal_month, 1);
+                            let idx = first + st.wDay as u32 - 1;
+                            let (row, col) = ((idx / 7) as f32, (idx % 7) as f32);
+                            let (tx, ty) = (cxm - 140.0 * s + col * 40.0 * s + 20.0 * s, y0 + 88.0 * s + row * 24.0 * s + 12.0 * s);
+                            if th.sharp {
+                                cv.rrect(tx - 12.0 * s, ty - 10.0 * s, 24.0 * s, 20.0 * s, 2.0 * s, th.accent, f);
+                            } else {
+                                cv.circle(tx, ty, 11.0 * s, th.accent, f);
+                            }
                         }
                     }
                     _ => {}
@@ -1936,7 +3077,7 @@ impl App {
                     if tt.battery {
                         cv.battery(x0 + 18.0 * s, y0 + h / 2.0 - 6.0 * s, s, self.batt, f);
                     } else {
-                        cv.clock_icon(x0 + 28.0 * s, y0 + h / 2.0, 10.0 * s, s, ORANGE, f);
+                        cv.clock_icon(x0 + 28.0 * s, y0 + h / 2.0, 10.0 * s, s, th.accent, f);
                     }
                 }
             }
@@ -1947,6 +3088,7 @@ impl App {
     unsafe fn draw_text(&self, m: &Media, mode: Mode, page: Page, wl: &[Widget], x0: f32, y0: f32, w: f32, h: f32, f: f32) {
         let dc = self.mem;
         let s = self.s;
+        let th = self.th;
         let cxm = self.pw as f32 / 2.0;
         SetBkMode(dc, TRANSPARENT);
         IntersectClipRect(dc, x0 as i32, y0 as i32, (x0 + w).ceil() as i32, (y0 + h).ceil() as i32);
@@ -1954,26 +3096,24 @@ impl App {
         let left = base | DT_LEFT | DT_VCENTER;
         let right = base | DT_RIGHT | DT_VCENTER;
         let center = base | DT_CENTER | DT_VCENTER;
-        let white = (255u8, 255u8, 255u8);
-        let gray = (165u8, 165u8, 172u8);
-        let orange = (255u8, 159u8, 10u8);
+        let (fg, fg2, accent) = (th.fg, th.fg2, th.accent);
         let st = GetLocalTime();
         let clock = format!("{:02}:{:02}", st.wHour, st.wMinute);
 
         match mode {
             Mode::Collapsed => match self.collapsed_view(m) {
                 0 => {
-                    let col = if self.timer_end.is_some() { orange } else { (200, 200, 205) };
+                    let col = if self.timer_end.is_some() { accent } else { fg2 };
                     self.txt(self.font_main, &fmt_timer(self.timer_secs()), x0 + 36.0 * s, y0, x0 + w - 12.0 * s, y0 + h, col, f, center);
                 }
                 1 => {
-                    self.txt(self.font_main, &fmt_sw(self.sw_elapsed()), x0 + 36.0 * s, y0, x0 + w - 10.0 * s, y0 + h, (48, 209, 88), f, center);
+                    self.txt(self.font_main, &fmt_sw(self.sw_elapsed()), x0 + 36.0 * s, y0, x0 + w - 10.0 * s, y0 + h, th.good, f, center);
                 }
                 2 => {
-                    self.txt(self.font_small, &m.title, x0 + 40.0 * s, y0, x0 + w - 40.0 * s, y0 + h, white, f, center);
+                    self.txt(self.font_small, &m.title, x0 + 40.0 * s, y0, x0 + w - 40.0 * s, y0 + h, fg, f, center);
                 }
                 3 => {
-                    self.txt(self.font_main, &clock, x0 + 10.0 * s, y0, x0 + w - 10.0 * s, y0 + h, white, f, center);
+                    self.txt(self.font_main, &clock, x0 + 10.0 * s, y0, x0 + w - 10.0 * s, y0 + h, fg, f, center);
                 }
                 _ => {}
             },
@@ -1981,43 +3121,98 @@ impl App {
                 match page {
                     Page::Music => {
                         if m.has {
-                            self.txt(self.font_main, &m.title, cxm - 126.0 * s, y0 + 44.0 * s, cxm + 160.0 * s, y0 + 66.0 * s, white, f, left);
-                            self.txt(self.font_small, &m.artist, cxm - 126.0 * s, y0 + 67.0 * s, cxm + 160.0 * s, y0 + 85.0 * s, gray, f, left);
+                            self.txt(self.font_main, &m.title, cxm - 126.0 * s, y0 + 44.0 * s, cxm + 160.0 * s, y0 + 66.0 * s, fg, f, left);
+                            self.txt(self.font_small, &m.artist, cxm - 126.0 * s, y0 + 67.0 * s, cxm + 160.0 * s, y0 + 85.0 * s, fg2, f, left);
                             if m.dur > 0.0 {
-                                self.txt(self.font_small, &fmt_time(m.cur_pos()), cxm - 208.0 * s, y0 + 98.0 * s, cxm - 154.0 * s, y0 + 118.0 * s, gray, f, right);
-                                self.txt(self.font_small, &fmt_time(m.dur), cxm + 154.0 * s, y0 + 98.0 * s, cxm + 208.0 * s, y0 + 118.0 * s, gray, f, left);
+                                self.txt(self.font_small, &fmt_time(m.cur_pos()), cxm - 208.0 * s, y0 + 98.0 * s, cxm - 154.0 * s, y0 + 118.0 * s, fg2, f, right);
+                                self.txt(self.font_small, &fmt_time(m.dur), cxm + 154.0 * s, y0 + 98.0 * s, cxm + 208.0 * s, y0 + 118.0 * s, fg2, f, left);
                             }
                         } else {
-                            self.txt(self.font_small, "Nada reproduciéndose", cxm - 200.0 * s, y0 + 40.0 * s, cxm + 200.0 * s, y0 + 92.0 * s, gray, f, center);
+                            self.txt(self.font_small, "Nada reproduciéndose", cxm - 200.0 * s, y0 + 40.0 * s, cxm + 200.0 * s, y0 + 92.0 * s, fg2, f, center);
+                        }
+                    }
+                    Page::Lyrics => {
+                        let (lx0, lx1) = (cxm - 200.0 * s, cxm + 200.0 * s);
+                        if !m.has {
+                            self.txt(self.font_small, "Nada reproduciéndose", lx0, y0 + 40.0 * s, lx1, y0 + 140.0 * s, fg2, f, center);
+                        } else {
+                            let head = format!("{} — {}", m.title, m.artist);
+                            self.txt(self.font_small, &head, lx0, y0 + 38.0 * s, lx1, y0 + 56.0 * s, fg2, f, center);
+                            let ly = self.lyrics.lock().unwrap();
+                            match ly.state {
+                                1 => self.txt(self.font_main, "Buscando letras…", lx0, y0 + 60.0 * s, lx1, y0 + 130.0 * s, fg, f, center),
+                                3 => self.txt(self.font_main, "No se encontraron letras", lx0, y0 + 60.0 * s, lx1, y0 + 130.0 * s, fg, f, center),
+                                2 => {
+                                    if !ly.lines.is_empty() {
+                                        let pos = m.cur_pos() + 0.25;
+                                        let ci: isize = ly.lines.iter().rposition(|(t0, _)| *t0 <= pos).map(|i| i as isize).unwrap_or(-1);
+                                        let lines = ly.lines.as_slice();
+                                        self.txt(self.font_small, lyric_line(lines, ci - 1), lx0, y0 + 62.0 * s, lx1, y0 + 82.0 * s, fg2, f, center);
+                                        self.txt(self.font_main, lyric_line(lines, ci), lx0, y0 + 84.0 * s, lx1, y0 + 110.0 * s, fg, f, center);
+                                        self.txt(self.font_small, lyric_line(lines, ci + 1), lx0, y0 + 112.0 * s, lx1, y0 + 132.0 * s, fg2, f, center);
+                                    } else {
+                                        let mut yy = y0 + 60.0 * s;
+                                        for line in ly.plain.iter().filter(|l| !l.is_empty()).take(4) {
+                                            self.txt(self.font_small, line, lx0, yy, lx1, yy + 20.0 * s, fg, f, center);
+                                            yy += 20.0 * s;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Page::Clock => {
                         const D: [&str; 7] = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
-                        const M: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
-                        let date = format!("{} {} {}", D[(st.wDayOfWeek as usize) % 7], st.wDay, M[((st.wMonth as usize).max(1) - 1) % 12]);
-                        self.txt(self.font_big, &clock, cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 82.0 * s, white, f, center);
-                        self.txt(self.font_small, &date, cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 102.0 * s, gray, f, center);
+                        let date = format!("{} {} de {}", D[(st.wDayOfWeek as usize) % 7], st.wDay, MONTHS_ES[((st.wMonth as usize).max(1) - 1) % 12]);
+                        self.txt(self.font_big, &clock, cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 82.0 * s, fg, f, center);
+                        self.txt(self.font_small, &date, cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 102.0 * s, fg2, f, center);
                         if self.batt.has {
-                            self.txt(self.font_small, &format!("{}%", self.batt.pct), cxm + 4.0 * s, y0 + 103.0 * s, cxm + 70.0 * s, y0 + 121.0 * s, gray, f, left);
+                            self.txt(self.font_small, &format!("{}%", self.batt.pct), cxm + 4.0 * s, y0 + 103.0 * s, cxm + 70.0 * s, y0 + 121.0 * s, fg2, f, left);
+                        }
+                    }
+                    Page::Calendar => {
+                        let title = format!("{} {}", MONTHS_ES[(self.cal_month as usize - 1) % 12], self.cal_year);
+                        self.txt(self.font_main, &title, cxm - 112.0 * s, y0 + 40.0 * s, cxm + 112.0 * s, y0 + 64.0 * s, fg, f, center);
+                        for (i, l) in ["L", "M", "X", "J", "V", "S", "D"].iter().enumerate() {
+                            let x = cxm - 140.0 * s + i as f32 * 40.0 * s;
+                            self.txt(self.font_small, l, x, y0 + 66.0 * s, x + 40.0 * s, y0 + 84.0 * s, fg2, f, center);
+                        }
+                        let first = weekday_mon0(self.cal_year, self.cal_month, 1);
+                        let n = days_in_month(self.cal_year, self.cal_month);
+                        let is_cur = st.wYear as i32 == self.cal_year && st.wMonth as u32 == self.cal_month;
+                        for d in 1..=n {
+                            let idx = first + d - 1;
+                            let (row, col) = ((idx / 7) as f32, idx % 7);
+                            let x = cxm - 140.0 * s + col as f32 * 40.0 * s;
+                            let y = y0 + 88.0 * s + row * 24.0 * s;
+                            let color = if is_cur && d == st.wDay as u32 {
+                                th.on_accent
+                            } else if col >= 5 {
+                                fg2
+                            } else {
+                                fg
+                            };
+                            self.txt(self.font_small, &d.to_string(), x, y, x + 40.0 * s, y + 24.0 * s, color, f, center);
                         }
                     }
                     Page::Timer => {
                         let col = if self.timer_end.is_some() {
-                            orange
+                            accent
                         } else if self.timer_paused.is_some() {
-                            (200, 200, 205)
+                            fg2
                         } else {
-                            white
+                            fg
                         };
                         self.txt(self.font_big, &fmt_timer(self.timer_secs()), cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 86.0 * s, col, f, center);
                     }
                     Page::Stopwatch => {
-                        self.txt(self.font_big, &fmt_sw(self.sw_elapsed()), cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 84.0 * s, white, f, center);
+                        self.txt(self.font_big, &fmt_sw(self.sw_elapsed()), cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 84.0 * s, fg, f, center);
                         let n = self.laps.len();
                         if n > 0 {
                             let prev = if n >= 2 { self.laps[n - 2] } else { 0.0 };
                             let line = format!("Vuelta {} · {}", n, fmt_sw(self.laps[n - 1] - prev));
-                            self.txt(self.font_small, &line, cxm - 150.0 * s, y0 + 84.0 * s, cxm + 150.0 * s, y0 + 100.0 * s, gray, f, center);
+                            self.txt(self.font_small, &line, cxm - 150.0 * s, y0 + 84.0 * s, cxm + 150.0 * s, y0 + 100.0 * s, fg2, f, center);
                         }
                     }
                     Page::Calc => {
@@ -2033,7 +3228,7 @@ impl App {
                                 String::new()
                             }
                         };
-                        self.txt(self.font_small, &tail_chars(&line, 30), cxm - 168.0 * s, y0 + 38.0 * s, cxm + 168.0 * s, y0 + 54.0 * s, gray, f, right);
+                        self.txt(self.font_small, &tail_chars(&line, 30), cxm - 168.0 * s, y0 + 38.0 * s, cxm + 168.0 * s, y0 + 54.0 * s, fg2, f, right);
                         let big = if self.calc_err {
                             "Error".to_string()
                         } else if self.calc_expr.is_empty() {
@@ -2041,26 +3236,65 @@ impl App {
                         } else {
                             tail_chars(&disp_expr(&self.calc_expr), 16)
                         };
-                        self.txt(self.font_big, &big, cxm - 168.0 * s, y0 + 54.0 * s, cxm + 168.0 * s, y0 + 90.0 * s, white, f, right);
+                        self.txt(self.font_big, &big, cxm - 168.0 * s, y0 + 54.0 * s, cxm + 168.0 * s, y0 + 90.0 * s, fg, f, right);
+                    }
+                    Page::Todo => {
+                        if self.todos.is_empty() {
+                            self.txt(self.font_small, "Sin tareas. Escribe arriba y pulsa Enter.", cxm - 196.0 * s, y0 + 80.0 * s, cxm + 196.0 * s, y0 + 110.0 * s, fg2, f, center);
+                        }
                     }
                     Page::Settings => {}
                 }
+
                 // etiquetas de los controles
                 for wd in wl {
+                    let (l, t, r, b) = (wd.x, wd.y, wd.x + wd.w, wd.y + wd.h);
                     match wd.kind {
-                        WKind::Tab => {
-                            let col = if wd.on { white } else { (150, 150, 158) };
-                            self.txt(self.font_small, wd.label, wd.x, wd.y, wd.x + wd.w, wd.y + wd.h, col, f, center);
+                        WKind::Tab(_) => {
+                            if wd.on {
+                                self.txt(self.font_small, wd.label, l + 28.0 * s, t, r, b, fg, f, left);
+                            }
                         }
-                        WKind::Pill => {
-                            self.txt(self.font_small, wd.label, wd.x, wd.y, wd.x + wd.w, wd.y + wd.h, white, f, center);
+                        WKind::Pill => self.txt(self.font_small, wd.label, l, t, r, b, fg, f, center),
+                        WKind::Chip => {
+                            let col = if wd.on { fg } else { fg2 };
+                            self.txt(self.font_small, wd.label, l, t, r, b, col, f, center);
                         }
                         WKind::Key(cls) => {
-                            let col = if cls == 1 { (0, 0, 0) } else { white };
-                            self.txt(self.font_main, wd.label, wd.x, wd.y, wd.x + wd.w, wd.y + wd.h, col, f, center);
+                            let col = match cls {
+                                0 => fg,
+                                1 => th.key_fn_fg,
+                                _ => th.on_accent,
+                            };
+                            self.txt(self.font_main, wd.label, l, t, r, b, col, f, center);
                         }
-                        WKind::Toggle => {
-                            self.txt(self.font_small, wd.label, wd.x + 4.0 * s, wd.y, wd.x + wd.w - 46.0 * s, wd.y + wd.h, white, f, left);
+                        WKind::Toggle => self.txt(self.font_small, wd.label, l + 4.0 * s, t, r - 46.0 * s, b, fg, f, left),
+                        WKind::Label => self.txt(self.font_small, wd.label, l, t, r, b, fg, f, left),
+                        WKind::Selector => self.txt(self.font_small, wd.label2, l, t, r, b, fg, f, center),
+                        WKind::Slider => {
+                            let val = match wd.act {
+                                Act::Slider(0) => format!("{}%", (self.cfg.op_min * 100.0).round() as i32),
+                                _ => format!("{} px", self.cfg.prox_dist.round() as i32),
+                            };
+                            self.txt(self.font_small, &val, r + 6.0 * s, t, r + 62.0 * s, b, fg2, f, left);
+                        }
+                        WKind::Check => {
+                            if let Act::TodoToggle(i) = wd.act {
+                                if i < self.todos.len() {
+                                    let (done, text) = (&self.todos[i].0, self.todos[i].1.as_str());
+                                    let font = if *done { self.font_strike } else { self.font_small };
+                                    let col = if *done { fg2 } else { fg };
+                                    self.txt(font, text, l + 28.0 * s, t, r - 6.0 * s, b, col, f, left);
+                                }
+                            }
+                        }
+                        WKind::Input => {
+                            if self.todo_input.is_empty() && !self.editing {
+                                self.txt(self.font_small, "Añadir tarea…", l + 10.0 * s, t, r - 8.0 * s, b, fg2, f, left);
+                            } else {
+                                let shown = format!("{}{}", self.todo_input, if self.editing { "|" } else { "" });
+                                self.txt(self.font_small, &tail_chars(&shown, 46), l + 10.0 * s, t, r - 8.0 * s, b, fg, f, left);
+                            }
                         }
                         _ => {}
                     }
@@ -2068,7 +3302,7 @@ impl App {
             }
             Mode::Toast => {
                 if let Some(t) = &self.toast {
-                    self.txt(self.font_main, &t.text, x0 + 58.0 * s, y0, x0 + w - 16.0 * s, y0 + h, white, f, left);
+                    self.txt(self.font_main, &t.text, x0 + 58.0 * s, y0, x0 + w - 16.0 * s, y0 + h, fg, f, left);
                 }
             }
         }
@@ -2081,6 +3315,7 @@ impl App {
         }
         let m = self.media.lock().unwrap().clone();
         let s = self.s;
+        let th = self.th;
         let (pw, ph) = (self.pw as usize, self.ph as usize);
         let buf: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(self.bits, pw * ph) };
         buf.fill(0);
@@ -2088,22 +3323,43 @@ impl App {
         self.sh.fill(0);
 
         let (x0, y0, w, h) = self.pill_rect();
-        let r = (h / 2.0).min(26.0 * s);
-        let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
-        let (hx, hy) = (w / 2.0 - r, h / 2.0 - r);
+        let notch = self.notch();
+        let r = if th.sharp { (3.0 * s).min(h / 2.0) } else { (h / 2.0).min(26.0 * s) };
+        let ext = if notch { 40.0 * s } else { 0.0 };
+        let (sy, shh) = (y0 - ext, h + ext);
+        let shape = Shape {
+            cx: x0 + w / 2.0,
+            cy: sy + shh / 2.0,
+            hx: w / 2.0 - r,
+            hy: shh / 2.0 - r,
+            r,
+            notch,
+            ex0: x0,
+            ex1: x0 + w,
+            e: 14.0 * s,
+        };
+        let e = if notch { shape.e } else { 0.0 };
+        let (cx, cy, hx, hy) = (shape.cx, shape.cy, shape.hx, shape.hy);
 
-        let xa = (x0.floor() as i32 - 1).max(0) as usize;
-        let xb = ((x0 + w).ceil() as i32 + 1).clamp(0, pw as i32) as usize;
-        let ya = (y0.floor() as i32 - 1).max(0) as usize;
+        let xa = ((x0 - e).floor() as i32 - 1).max(0) as usize;
+        let xb = ((x0 + w + e).ceil() as i32 + 1).clamp(0, pw as i32) as usize;
+        let ya = if notch { 0 } else { (y0.floor() as i32 - 1).max(0) as usize };
         let yb = ((y0 + h).ceil() as i32 + 1).clamp(0, ph as i32) as usize;
 
-        // sombra (se salta el interior de la pildora)
+        // sombra (solo estilo isla; se salta el interior de la pildora)
+        let shadow_on = self.feat(F_SHADOW) && !notch;
         let (bl, off) = (20.0 * s, 5.0 * s);
-        let sxa = (x0 - bl - 2.0).floor().max(0.0) as usize;
-        let sxb = ((x0 + w + bl + 2.0).ceil() as usize).min(pw);
-        let sya = (y0 - bl).floor().max(0.0) as usize;
-        let syb = ((y0 + h + bl + off + 2.0).ceil() as usize).min(ph);
-        if self.feat(F_SHADOW) {
+        let (sxa, sxb, sya, syb) = if shadow_on {
+            (
+                (x0 - bl - 2.0).floor().max(0.0) as usize,
+                ((x0 + w + bl + 2.0).ceil() as usize).min(pw),
+                (y0 - bl).floor().max(0.0) as usize,
+                ((y0 + h + bl + off + 2.0).ceil() as usize).min(ph),
+            )
+        } else {
+            (xa, xb, ya, yb)
+        };
+        if shadow_on {
             let il = (x0 + 1.5 * s).ceil().max(0.0) as usize;
             let ir = (x0 + w - 1.5 * s).floor().max(0.0) as usize;
             for y in sya..syb {
@@ -2125,24 +3381,26 @@ impl App {
             }
         }
 
-        // pildora + borde interior sutil (el interior se rellena de golpe)
+        // pildora (relleno del tema + borde); el interior se rellena de golpe
+        let bgp = pack(th.bg);
         let ix0 = ((x0 + 2.0 * s).ceil() as usize).min(xb);
         let ix1 = ((x0 + w - 2.0 * s).floor().max(0.0) as usize).min(xb);
-        let iy0 = ((y0 + r).ceil() as usize).min(yb);
+        let iy0 = if notch { 0 } else { ((y0 + r).ceil() as usize).min(yb) };
         let iy1 = ((y0 + h - r).floor().max(0.0) as usize).min(yb);
         for y in ya..yb {
             if y >= iy0 && y < iy1 && ix0 < ix1 {
                 for x in xa..ix0 {
-                    pill_pixel(x, y, pw, cx, cy, hx, hy, r, s, &mut self.cov, buf);
+                    pill_pixel(x, y, pw, &shape, s, bgp, th.ring, &mut self.cov, buf);
                 }
                 let row = y * pw;
                 self.cov[row + ix0..row + ix1].fill(255);
+                buf[row + ix0..row + ix1].fill(bgp);
                 for x in ix1..xb {
-                    pill_pixel(x, y, pw, cx, cy, hx, hy, r, s, &mut self.cov, buf);
+                    pill_pixel(x, y, pw, &shape, s, bgp, th.ring, &mut self.cov, buf);
                 }
             } else {
                 for x in xa..xb {
-                    pill_pixel(x, y, pw, cx, cy, hx, hy, r, s, &mut self.cov, buf);
+                    pill_pixel(x, y, pw, &shape, s, bgp, th.ring, &mut self.cov, buf);
                 }
             }
         }
@@ -2169,7 +3427,10 @@ impl App {
             None => Vec::new(),
         };
         {
-            let mut cv = Canvas { b: &mut *buf, pw, ph };
+            let mut cv = Canvas { b: &mut *buf, pw, ph, th };
+            if th.frame && self.mode == Mode::Expanded {
+                cv.frame(x0, y0, w, h, s);
+            }
             if let Some((pm, pp, fo)) = old {
                 self.draw_software(&mut cv, &m, pm, pp, &wl_old, x0, y0, w, h, fo);
             }
@@ -2188,8 +3449,8 @@ impl App {
             for x in sxa..sxb {
                 let i = y * pw + x;
                 let c = self.cov[i] as u32;
-                let sh = self.sh[i] as u32;
-                let a = c + sh * (255 - c) / 255;
+                let shv = self.sh[i] as u32;
+                let a = c + shv * (255 - c) / 255;
                 if a == 0 {
                     buf[i] = 0;
                     continue;
@@ -2206,7 +3467,7 @@ impl App {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: (self.opacity.clamp(0.05, 1.0) * 255.0) as u8,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let _ = UpdateLayeredWindow(
@@ -2224,6 +3485,7 @@ impl App {
     }
 }
 
+
 // ------------------------------------------------------------ bandeja (tray)
 
 fn make_icon() -> HICON {
@@ -2235,9 +3497,9 @@ fn make_icon() -> HICON {
                 let d = sdf_rr(x as f32 + 0.5, y as f32 + 0.5, 16.0, 16.0, 7.0, 0.0, 7.0);
                 let a = (0.5 - d).clamp(0.0, 1.0);
                 if a > 0.0 {
-                    let c = if d > -2.0 { 225.0 } else { 0.0 };
+                    let cc = if d > -2.0 { 225.0 } else { 0.0 };
                     let al = (a * 255.0) as u32;
-                    let v = (c * a) as u32;
+                    let v = (cc * a) as u32;
                     px[(y * n + x) as usize] = (al << 24) | (v << 16) | (v << 8) | v;
                 }
             }
@@ -2262,8 +3524,8 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     };
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    for (i, c) in "Dynamic Island".encode_utf16().enumerate() {
-        nid.szTip[i] = c;
+    for (i, ch) in "Dynamic Island".encode_utf16().enumerate() {
+        nid.szTip[i] = ch;
     }
     nid
 }
@@ -2313,6 +3575,7 @@ fn show_menu(hwnd: HWND) -> i32 {
             }
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Funciones"));
         }
+        let _ = AppendMenuW(menu, MF_STRING, 150, w!("Restablecer posición"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let fl = if auto { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, fl, 120, w!("Iniciar con Windows"));
@@ -2336,6 +3599,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let id = wp.0;
                 with_app(|a| match id {
                     T_VIS => a.vis_tick(),
+                    T_PROX => a.prox_tick(),
                     _ => a.clock_tick(),
                 });
                 LRESULT(0)
@@ -2359,15 +3623,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 with_app(|a| a.on_leave());
                 LRESULT(0)
             }
+            WM_LBUTTONDOWN => {
+                let x = (lp.0 & 0xFFFF) as i16 as i32;
+                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                with_app(|a| a.on_down(x, y));
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
                 let x = (lp.0 & 0xFFFF) as i16 as i32;
                 let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                with_app(|a| a.click(x, y));
+                with_app(|a| a.on_up(x, y));
                 LRESULT(0)
             }
             WM_CHAR => {
                 let ch = char::from_u32(wp.0 as u32).unwrap_or('\0');
                 with_app(|a| a.on_char(ch));
+                LRESULT(0)
+            }
+            WM_KILLFOCUS => {
+                with_app(|a| a.end_edit(false));
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
@@ -2380,12 +3654,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-                let mut over = false;
-                with_app(|a| over = a.hover && a.feat(F_VOLUME));
-                if over && delta != 0 {
-                    let n = (delta.abs() / 120).clamp(1, 5);
-                    key_tap(if delta > 0 { 0xAF } else { 0xAE }, n);
-                }
+                with_app(|a| a.on_wheel(delta));
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -2403,7 +3672,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 with_app(|a| a.on_media());
                 LRESULT(0)
             }
-            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE_),
+            WM_MOUSEACTIVATE => {
+                let mut ed = false;
+                with_app(|a| ed = a.editing);
+                LRESULT(if ed { MA_ACTIVATE_ } else { MA_NOACTIVATE_ })
+            }
             WM_DESTROY => {
                 tray_remove(hwnd);
                 PostQuitMessage(0);
@@ -2456,15 +3729,21 @@ fn main() -> windows::core::Result<()> {
         let s = GetDpiForSystem() as f32 / 96.0;
         let (pw, ph) = ((CW * s) as i32, (CH * s) as i32);
         let sw = GetSystemMetrics(SM_CXSCREEN);
-        let pos = POINT { x: (sw - pw) / 2, y: 0 };
+        let home = POINT { x: (sw - pw) / 2, y: 0 };
+
+        let (features, cfg) = load_config();
+        MUSIC_ON.store(features[F_MUSIC], Ordering::Relaxed);
+        COVER_ON.store(features[F_COVER], Ordering::Relaxed);
+        let th = theme_of(cfg.theme);
+        let start = if cfg.style == 1 { home } else { POINT { x: home.x + cfg.dx, y: home.y + cfg.dy } };
 
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("DynamicIslandWnd"),
             w!("DynamicIsland"),
             WS_POPUP,
-            pos.x,
-            pos.y,
+            start.x,
+            start.y,
             pw,
             ph,
             None,
@@ -2492,10 +3771,6 @@ fn main() -> windows::core::Result<()> {
         SelectObject(mem, HGDIOBJ(bmp.0));
         ReleaseDC(None, screen);
 
-        let features = load_features();
-        MUSIC_ON.store(features[F_MUSIC], Ordering::Relaxed);
-        COVER_ON.store(features[F_COVER], Ordering::Relaxed);
-
         let media = Arc::new(Mutex::new(Media::default()));
         {
             let m = media.clone();
@@ -2508,19 +3783,25 @@ fn main() -> windows::core::Result<()> {
             let _ = ANIM_THREAD.set(h.thread().clone());
         }
 
+        let face: &str = if cfg.font == 0 { th.font } else { FONTS[cfg.font as usize] };
         let n = (pw * ph) as usize;
         let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
+        let now_t = GetLocalTime();
         let app = App {
             hwnd,
             mem,
             bits: bits as *mut u32,
             pw,
             ph,
-            pos,
+            pos: start,
+            home,
             s,
-            font_main: make_font((15.0 * s) as i32, 600),
-            font_small: make_font((13.0 * s) as i32, 400),
-            font_big: make_font((30.0 * s) as i32, 300),
+            font_main: make_font(face, (15.0 * s) as i32, 600, false),
+            font_small: make_font(face, (13.0 * s) as i32, 400, false),
+            font_big: make_font(face, (30.0 * s) as i32, 300, false),
+            font_strike: make_font(face, (13.0 * s) as i32, 400, true),
+            cfg,
+            th,
             cur: [120.0, 34.0],
             vel: [0.0, 0.0],
             mode: Mode::Collapsed,
@@ -2528,12 +3809,16 @@ fn main() -> windows::core::Result<()> {
             prev_view: None,
             layout_key: (Mode::Collapsed, Page::Clock, false, false),
             fade: 1.0,
+            opacity: 1.0,
+            opacity_target: 1.0,
             hover: false,
             pinned: false,
+            editing: false,
             hover_act: None,
             tracking: false,
             animating: false,
             vis_on: false,
+            prox_on: false,
             hidden: false,
             last: Instant::now(),
             t0: Instant::now(),
@@ -2548,6 +3833,7 @@ fn main() -> windows::core::Result<()> {
             low_warned: false,
             features,
             autostart: autostart_enabled(),
+            settings_tab: 0,
             timer_set: 5 * 60,
             timer_end: None,
             timer_paused: None,
@@ -2558,6 +3844,15 @@ fn main() -> windows::core::Result<()> {
             calc_prev: String::new(),
             calc_done: false,
             calc_err: false,
+            cal_year: now_t.wYear as i32,
+            cal_month: now_t.wMonth as u32,
+            todos: load_todos(),
+            todo_input: String::new(),
+            todo_scroll: 0,
+            lyrics: Arc::new(Mutex::new(Lyrics::default())),
+            lyr_key: (String::new(), String::new()),
+            slider_drag: None,
+            drag: None,
             prev_fg: 0,
         };
         APP.with(|c| *c.borrow_mut() = Some(app));
@@ -2567,8 +3862,13 @@ fn main() -> windows::core::Result<()> {
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         with_app(|a| {
+            a.apply_pos();
             a.ensure_page();
             a.render();
+            if a.feat(F_PROX) {
+                SetTimer(a.hwnd, T_PROX, 150, None);
+                a.prox_on = true;
+            }
         });
         SetTimer(hwnd, T_CLOCK, 1000, None);
 
