@@ -205,7 +205,8 @@ const F_TODO: usize = 13;
 const F_NOTIF: usize = 14;
 const F_PROX: usize = 15;
 const F_DRAG: usize = 16;
-const F_COUNT: usize = 17;
+const F_LYRMODE: usize = 17;
+const F_COUNT: usize = 18;
 
 // (clave en config.ini, etiqueta)
 const FEATURES: [(&str, &str); F_COUNT] = [
@@ -226,11 +227,12 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("notif", "Botón de notificaciones"),
     ("proximity", "Opacidad por proximidad"),
     ("drag", "Mover libremente"),
+    ("lyricmode", "Letra en la isla"),
 ];
 
 // que funciones salen en la pestaña "Funciones" de Ajustes
-const FUNC_LIST: [usize; 10] = [
-    F_MUSIC, F_LYRICS, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF, F_BATT,
+const FUNC_LIST: [usize; 11] = [
+    F_MUSIC, F_LYRICS, F_LYRMODE, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF, F_BATT,
 ];
 
 // teclas de la calculadora: (etiqueta, estilo 0=numero 1=funcion 2=operador)
@@ -491,7 +493,8 @@ struct App {
     mode: Mode,
     page: Page,
     prev_view: Option<(Mode, Page)>,
-    layout_key: (Mode, Page, bool, bool),
+    layout_key: (Mode, Page, bool, u8),
+    lyr_idx: isize,
     fade: f32,
     opacity: f32,
     opacity_target: f32,
@@ -564,6 +567,7 @@ fn data_dir() -> Option<std::path::PathBuf> {
 fn load_config() -> ([bool; F_COUNT], Cfg) {
     let mut f = [true; F_COUNT];
     f[F_PROX] = false; // la opacidad por proximidad es opt-in
+    f[F_LYRMODE] = false; // la letra en la isla es opt-in
     let mut cfg = Cfg::default();
     if let Some(d) = data_dir() {
         if let Ok(txt) = std::fs::read_to_string(d.join("config.ini")) {
@@ -1616,6 +1620,22 @@ impl App {
         }
     }
 
+    /// Letra sincronizada lista para mostrarse en la isla colapsada.
+    fn lyric_ready(&self, m: &Media) -> bool {
+        if !self.feat(F_LYRMODE) || !m.has {
+            return false;
+        }
+        let l = self.lyrics.lock().unwrap();
+        l.state == 2 && !l.lines.is_empty() && l.key.0 == m.artist && l.key.1 == m.title
+    }
+
+    /// Indice de la linea de letra actual (-1 si aun no empieza).
+    fn lyric_idx(&self, m: &Media) -> isize {
+        let pos = m.cur_pos() + 0.25;
+        let l = self.lyrics.lock().unwrap();
+        l.lines.iter().rposition(|(t0, _)| *t0 <= pos).map(|i| i as isize).unwrap_or(-1)
+    }
+
     fn timer_active(&self) -> bool {
         self.timer_end.is_some() || self.timer_paused.is_some()
     }
@@ -1637,6 +1657,8 @@ impl App {
             0
         } else if self.sw_start.is_some() {
             1
+        } else if self.lyric_ready(m) {
+            5
         } else if m.has {
             2
         } else if self.feat(F_CLOCK) {
@@ -1651,17 +1673,16 @@ impl App {
         if self.hidden {
             return false;
         }
-        let (has, playing) = {
-            let m = self.media.lock().unwrap();
-            (m.has, m.playing)
-        };
+        let mc = self.media.lock().unwrap().clone();
+        let (has, playing) = (mc.has, mc.playing);
         let vis = has && playing && self.feat(F_VIS);
         let sw = self.sw_start.is_some();
+        let lyr_mode = playing && self.collapsed_view(&mc) == 5;
         match self.mode {
             Mode::Collapsed => {
                 if self.timer_active() {
                     false
-                } else if sw {
+                } else if sw || lyr_mode {
                     true
                 } else {
                     vis
@@ -1696,7 +1717,7 @@ impl App {
                 Page::Calc => (EW, 304.0),
                 Page::Todo => (EW, 230.0),
                 Page::Settings => match self.settings_tab {
-                    0 => (EW, 242.0),
+                    0 => (EW, 272.0),
                     1 => (EW, 272.0),
                     _ => (EW, 332.0),
                 },
@@ -1704,6 +1725,7 @@ impl App {
             Mode::Collapsed => match self.collapsed_view(m) {
                 0 | 1 => (132.0, 34.0),
                 2 => (226.0, 34.0),
+                5 => (320.0, 34.0),
                 3 => (120.0, 34.0),
                 _ => (96.0, 30.0),
             },
@@ -1738,9 +1760,9 @@ impl App {
             Mode::Collapsed
         };
         let kp = if new == Mode::Expanded { self.page } else { Page::Clock };
-        let has = self.media.lock().unwrap().has;
-        let active = self.timer_active() || self.sw_start.is_some();
-        let key = (new, kp, has, active);
+        let mc = self.media.lock().unwrap().clone();
+        let cv = self.collapsed_view(&mc);
+        let key = (new, kp, mc.has, cv);
         let (om, op) = (self.layout_key.0, self.layout_key.1);
         self.mode = new;
         if key != self.layout_key {
@@ -1753,7 +1775,7 @@ impl App {
         if new != Mode::Expanded {
             self.hover_act = None;
         }
-        if new == Mode::Expanded && self.page == Page::Lyrics {
+        if (new == Mode::Expanded && self.page == Page::Lyrics) || self.feat(F_LYRMODE) {
             self.check_lyrics();
         }
         self.start_anim();
@@ -1795,7 +1817,7 @@ impl App {
     }
 
     fn check_lyrics(&mut self) {
-        if !self.feat(F_LYRICS) {
+        if !self.feat(F_LYRICS) && !self.feat(F_LYRMODE) {
             return;
         }
         let m = self.media.lock().unwrap().clone();
@@ -1882,6 +1904,20 @@ impl App {
 
     fn vis_tick(&mut self) {
         if self.live_visible() {
+            // con la letra en la isla solo se redibuja al cambiar de linea
+            if self.mode == Mode::Collapsed && self.sw_start.is_none() && !self.timer_active() {
+                let m = self.media.lock().unwrap().clone();
+                if self.collapsed_view(&m) == 5 {
+                    let idx = self.lyric_idx(&m);
+                    if idx != self.lyr_idx {
+                        self.lyr_idx = idx;
+                        if !self.animating {
+                            self.render();
+                        }
+                    }
+                    return;
+                }
+            }
             if !self.animating {
                 self.render();
             }
@@ -3112,6 +3148,13 @@ impl App {
                 2 => {
                     self.txt(self.font_small, &m.title, x0 + 40.0 * s, y0, x0 + w - 40.0 * s, y0 + h, fg, f, center);
                 }
+                5 => {
+                    let ly = self.lyrics.lock().unwrap();
+                    let pos = m.cur_pos() + 0.25;
+                    let ci: isize = ly.lines.iter().rposition(|(t0, _)| *t0 <= pos).map(|i| i as isize).unwrap_or(-1);
+                    let text: &str = if ci < 0 { m.title.as_str() } else { lyric_line(&ly.lines, ci) };
+                    self.txt(self.font_main, text, x0 + 14.0 * s, y0, x0 + w - 14.0 * s, y0 + h, fg, f, center);
+                }
                 3 => {
                     self.txt(self.font_main, &clock, x0 + 10.0 * s, y0, x0 + w - 10.0 * s, y0 + h, fg, f, center);
                 }
@@ -3807,7 +3850,8 @@ fn main() -> windows::core::Result<()> {
             mode: Mode::Collapsed,
             page: Page::Clock,
             prev_view: None,
-            layout_key: (Mode::Collapsed, Page::Clock, false, false),
+            layout_key: (Mode::Collapsed, Page::Clock, false, 3),
+            lyr_idx: -2,
             fade: 1.0,
             opacity: 1.0,
             opacity_target: 1.0,
