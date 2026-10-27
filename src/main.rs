@@ -53,10 +53,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ------------------------------------------------------------ constantes
 
-const CW: f32 = 520.0; // lienzo (logico)
+const CW: f32 = 700.0; // lienzo (logico)
 const CH: f32 = 390.0;
 const TOP: f32 = 8.0; // separacion con el borde superior (estilo isla)
 const EW: f32 = 440.0; // ancho de la isla expandida
+const EW_WIDE: f32 = 620.0; // ancho para las paginas horizontales (Tiempo y Reloj)
 const CS: usize = 96; // lado de la caratula decodificada
 
 const WM_APP_MEDIA: u32 = 0x8000 + 1;
@@ -286,6 +287,7 @@ struct Cfg {
     wx_lat: f32,
     wx_lon: f32,
     wx_unit: u8, // 0 °C, 1 °F
+    lyrics_open: bool,
 }
 
 impl Default for Cfg {
@@ -302,6 +304,7 @@ impl Default for Cfg {
             wx_lat: 0.0,
             wx_lon: 0.0,
             wx_unit: 0,
+            lyrics_open: false,
         }
     }
 }
@@ -411,6 +414,7 @@ enum Act {
     Tab(Page),
     Pin,
     Notif,
+    Lyrics,
     Prev,
     Toggle,
     Next,
@@ -462,6 +466,7 @@ enum WKind {
     Big(Icon),
     Bar,
     Chip,
+    Lyric,
     Selector,
     Slider,
     Arrow(i8),
@@ -666,6 +671,7 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
                         "wx_lat" => cfg.wx_lat = v.parse::<f32>().unwrap_or(0.0),
                         "wx_lon" => cfg.wx_lon = v.parse::<f32>().unwrap_or(0.0),
                         "wx_unit" => cfg.wx_unit = v.parse::<u8>().unwrap_or(0).min(1),
+                        "lyrics_open" => cfg.lyrics_open = v != "0",
                         _ => {}
                     }
                 }
@@ -687,11 +693,12 @@ fn save_config(f: &[bool; F_COUNT], cfg: &Cfg) {
         s.push_str(&format!("pos_dx={}\npos_dy={}\n", cfg.dx, cfg.dy));
         let city = cfg.city.replace('\n', " ").replace('\r', " ");
         s.push_str(&format!(
-            "city={}\nwx_lat={:.5}\nwx_lon={:.5}\nwx_unit={}\n",
+            "city={}\nwx_lat={:.5}\nwx_lon={:.5}\nwx_unit={}\nlyrics_open={}\n",
             city.trim(),
             cfg.wx_lat,
             cfg.wx_lon,
-            cfg.wx_unit
+            cfg.wx_unit,
+            if cfg.lyrics_open { 1 } else { 0 }
         ));
         let _ = std::fs::write(d.join("config.ini"), s);
     }
@@ -2017,7 +2024,7 @@ impl App {
             Mode::Expanded => match self.page {
                 Page::Music => {
                     let l = self.lyrics.lock().unwrap();
-                    vis || (has && playing && l.state == 2 && !l.lines.is_empty())
+                    vis || (self.cfg.lyrics_open && has && playing && l.state == 2 && !l.lines.is_empty())
                 }
                 Page::Time => self.time_tab == 2 && sw,
                 _ => false,
@@ -2031,7 +2038,7 @@ impl App {
             Mode::Toast => (280.0, 46.0),
             Mode::Expanded => match self.page {
                 Page::Music => {
-                    if m.has && (self.feat(F_LYRICS) || self.feat(F_LYRMODE)) {
+                    if m.has && self.cfg.lyrics_open && (self.feat(F_LYRICS) || self.feat(F_LYRMODE)) {
                         (EW, 232.0)
                     } else if m.has {
                         (EW, 158.0)
@@ -2041,10 +2048,14 @@ impl App {
                 }
                 Page::Clock => {
                     let wx_ready = self.feat(F_WEATHER) && self.wx.lock().unwrap().state == 2;
-                    (EW, if wx_ready { 160.0 } else { 128.0 })
+                    if wx_ready {
+                        (EW_WIDE, 170.0)
+                    } else {
+                        (EW, 128.0)
+                    }
                 }
                 Page::Calendar => (EW, 244.0),
-                Page::Time => (EW, 210.0),
+                Page::Time => (EW_WIDE, 230.0),
                 Page::Calc => (EW, 304.0),
                 Page::Todo => (EW, 230.0),
                 Page::Weather => (EW, 250.0),
@@ -2112,7 +2123,9 @@ impl App {
         if new != Mode::Expanded {
             self.hover_act = None;
         }
-        if (new == Mode::Expanded && self.page == Page::Music) || self.feat(F_LYRMODE) {
+        if (new == Mode::Expanded && self.page == Page::Music && self.cfg.lyrics_open)
+            || self.feat(F_LYRMODE)
+        {
             self.check_lyrics();
         }
         self.start_anim();
@@ -3011,6 +3024,10 @@ impl App {
                 self.prox_tick();
             }
             Act::Notif => open_notif(),
+            Act::Lyrics => {
+                self.cfg.lyrics_open = !self.cfg.lyrics_open;
+                save_config(&self.features, &self.cfg);
+            }
             Act::Prev => media_cmd(Cmd::Prev),
             Act::Toggle => media_cmd(Cmd::Toggle),
             Act::Next => media_cmd(Cmd::Next),
@@ -3487,7 +3504,7 @@ impl App {
         let s = self.s;
         let cx = self.pw as f32 / 2.0;
         let y0 = self.top();
-        let half = EW / 2.0;
+        let half = self.cur[0] / 2.0;
 
         // barra de pestañas (iconos; la activa muestra su nombre)
         const TABS: [(Page, &str, f32); 10] = [
@@ -3528,6 +3545,12 @@ impl App {
                     v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::Toggle, ""));
                     v.push(Widget::new(cx + 40.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Next), Act::Next, ""));
                     v.push(Widget::new(cx - 156.0 * s, y0 + 98.0 * s, 312.0 * s, 20.0 * s, WKind::Bar, Act::Seek(0.0), ""));
+                    if self.feat(F_LYRICS) || self.feat(F_LYRMODE) {
+                        v.push(
+                            Widget::new(cx + 96.0 * s, y0 + 121.0 * s, 26.0 * s, 26.0 * s, WKind::Lyric, Act::Lyrics, "")
+                                .on(self.cfg.lyrics_open),
+                        );
+                    }
                 }
             }
             Page::Calendar => {
@@ -3536,48 +3559,58 @@ impl App {
                 v.push(Widget::new(cx + 158.0 * s, y0 + 41.0 * s, 48.0 * s, 22.0 * s, WKind::Pill, Act::CalToday, "Hoy"));
             }
             Page::Time => {
-                let tabs: [(&'static str, u8, f32); 3] = [
-                    ("Pomodoro", 0, 74.0),
-                    ("Temporizador", 1, 92.0),
-                    ("Cronómetro", 2, 88.0),
+                // Columna izquierda con las tres herramientas; contenido a la derecha.
+                let sx = cx - half * s + 24.0 * s;
+                let tabs: [(&'static str, u8); 3] = [
+                    ("Pomodoro", 0),
+                    ("Temporizador", 1),
+                    ("Cronómetro", 2),
                 ];
-                let gap = 6.0;
-                let enabled: Vec<&(&'static str, u8, f32)> =
-                    tabs.iter().filter(|(_, id, _)| self.time_tab_enabled(*id)).collect();
-                let total: f32 = enabled.iter().map(|(_, _, w)| *w).sum::<f32>()
-                    + gap * enabled.len().saturating_sub(1) as f32;
-                let mut x = cx - total * s / 2.0;
-                for (label, id, wd) in enabled {
+                let mut row = 0.0;
+                for (label, id) in tabs {
+                    if !self.time_tab_enabled(id) {
+                        continue;
+                    }
                     v.push(
-                        Widget::new(x, y0 + 40.0 * s, *wd * s, 22.0 * s, WKind::Chip, Act::TimeTab(*id), *label)
-                            .on(self.time_tab == *id),
+                        Widget::new(
+                            sx,
+                            y0 + 56.0 * s + row * 42.0 * s,
+                            170.0 * s,
+                            34.0 * s,
+                            WKind::Chip,
+                            Act::TimeTab(id),
+                            label,
+                        )
+                        .on(self.time_tab == id),
                     );
-                    x += (*wd + gap) * s;
+                    row += 1.0;
                 }
+
+                let ccx = cx + 99.0 * s;
                 let yc = y0 + 164.0 * s;
                 match self.time_tab {
                     0 => {
-                        v.push(Widget::new(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::PomoReset, "Reiniciar"));
+                        v.push(Widget::new(ccx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::PomoReset, "Reiniciar"));
                         let big = if self.pomo_end.is_some() { Icon::Pause } else { Icon::Play };
-                        v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::PomoToggle, ""));
-                        v.push(Widget::new(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::PomoSkip, "Saltar"));
+                        v.push(Widget::new(ccx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::PomoToggle, ""));
+                        v.push(Widget::new(ccx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::PomoSkip, "Saltar"));
                     }
                     1 => {
                         let presets: [(&'static str, u64); 4] = [("1 min", 1), ("5 min", 5), ("10 min", 10), ("25 min", 25)];
                         for (i, (l, mins)) in presets.iter().enumerate() {
-                            let px = cx - 128.0 * s + i as f32 * 66.0 * s;
+                            let px = ccx - 128.0 * s + i as f32 * 66.0 * s;
                             v.push(Widget::new(px, y0 + 112.0 * s, 58.0 * s, 22.0 * s, WKind::Pill, Act::Preset(*mins), *l));
                         }
-                        v.push(Widget::new(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerReset, "Reiniciar"));
+                        v.push(Widget::new(ccx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerReset, "Reiniciar"));
                         let big = if self.timer_end.is_some() { Icon::Pause } else { Icon::Play };
-                        v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::TimerToggle, ""));
-                        v.push(Widget::new(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerAdd, "+1 min"));
+                        v.push(Widget::new(ccx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::TimerToggle, ""));
+                        v.push(Widget::new(ccx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::TimerAdd, "+1 min"));
                     }
                     _ => {
-                        v.push(Widget::new(cx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwLap, "Vuelta"));
+                        v.push(Widget::new(ccx - 136.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwLap, "Vuelta"));
                         let big = if self.sw_start.is_some() { Icon::Pause } else { Icon::Play };
-                        v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::SwToggle, ""));
-                        v.push(Widget::new(cx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwReset, "Reiniciar"));
+                        v.push(Widget::new(ccx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::SwToggle, ""));
+                        v.push(Widget::new(ccx + 64.0 * s, yc - 13.0 * s, 72.0 * s, 26.0 * s, WKind::Pill, Act::SwReset, "Reiniciar"));
                     }
                 }
             }
@@ -3798,6 +3831,17 @@ impl App {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, f);
                     }
                 }
+                WKind::Lyric => {
+                    if wd.on {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.accent, 0.16 * f);
+                    } else if hov {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.07 * f);
+                    }
+                    let col = if wd.on { th.accent } else if hov { th.fg } else { th.fg2 };
+                    cv.rrect(cx - 7.0 * s, cy - 5.5 * s, 14.0 * s, 2.0 * s, 1.0 * s, col, f);
+                    cv.rrect(cx - 7.0 * s, cy - 1.0 * s, 10.0 * s, 2.0 * s, 1.0 * s, col, f);
+                    cv.rrect(cx - 7.0 * s, cy + 3.5 * s, 12.0 * s, 2.0 * s, 1.0 * s, col, f);
+                }
                 WKind::Selector => {
                     if hov {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.7 * f);
@@ -3909,29 +3953,43 @@ impl App {
                         }
                     }
                     Page::Clock => {
-                        if self.batt.has {
-                            cv.battery(cxm - 34.0 * s, y0 + 106.0 * s, s, self.batt, f);
-                        }
-                        if self.feat(F_WEATHER) {
-                            let wx = self.wx.lock().unwrap().clone();
-                            if wx.state == 2 {
-                                cv.weather_icon(
-                                    weather::icon_kind(wx.code),
-                                    wx.is_day,
-                                    cxm - 92.0 * s,
-                                    y0 + 128.0 * s,
-                                    10.0 * s,
-                                    f,
-                                );
+                        let wx = self.wx.lock().unwrap().clone();
+                        let wx_ready = self.feat(F_WEATHER) && wx.state == 2;
+                        if wx_ready {
+                            let half = self.cur[0] / 2.0;
+                            cv.rrect(cxm - 0.5 * s, y0 + 42.0 * s, 1.0 * s, 104.0 * s, 0.5 * s, th.fg, 0.10 * f);
+                            if self.batt.has {
+                                cv.battery(cxm - (half * s) / 2.0 - 34.0 * s, y0 + 126.0 * s, s, self.batt, f);
                             }
+                            cv.weather_icon(
+                                weather::icon_kind(wx.code),
+                                wx.is_day,
+                                cxm + 55.0 * s,
+                                y0 + 72.0 * s,
+                                14.0 * s,
+                                f,
+                            );
+                        } else if self.batt.has {
+                            cv.battery(cxm - 34.0 * s, y0 + 106.0 * s, s, self.batt, f);
                         }
                     }
                     Page::Time => {
+                        let half = self.cur[0] / 2.0;
+                        cv.rrect(
+                            cxm - half * s + 206.0 * s,
+                            y0 + 56.0 * s,
+                            1.0 * s,
+                            120.0 * s,
+                            0.5 * s,
+                            th.fg,
+                            0.10 * f,
+                        );
                         if self.time_tab == 0 {
                             let filled = if self.pomo_phase == 2 { 4 } else { self.pomo_round % 4 };
-                            let cy = y0 + 138.0 * s;
+                            let ccx = cxm + 99.0 * s;
+                            let cy = y0 + 136.0 * s;
                             for i in 0..4 {
-                                let x = cxm - 24.0 * s + i as f32 * 16.0 * s;
+                                let x = ccx - 24.0 * s + i as f32 * 16.0 * s;
                                 cv.circle(x, cy, 3.5 * s, if i < filled { th.accent } else { th.track }, f);
                             }
                         }
@@ -4081,7 +4139,7 @@ impl App {
                                 self.txt(self.font_small, &fmt_time(m.cur_pos()), cxm - 208.0 * s, y0 + 98.0 * s, cxm - 154.0 * s, y0 + 118.0 * s, fg2, f, right);
                                 self.txt(self.font_small, &fmt_time(m.dur), cxm + 154.0 * s, y0 + 98.0 * s, cxm + 208.0 * s, y0 + 118.0 * s, fg2, f, left);
                             }
-                            if self.feat(F_LYRICS) || self.feat(F_LYRMODE) {
+                            if self.cfg.lyrics_open && (self.feat(F_LYRICS) || self.feat(F_LYRMODE)) {
                                 let (lx0, lx1) = (cxm - 200.0 * s, cxm + 200.0 * s);
                                 let ly = self.lyrics.lock().unwrap();
                                 match ly.state {
@@ -4113,18 +4171,26 @@ impl App {
                     Page::Clock => {
                         const D: [&str; 7] = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
                         let date = format!("{} {} de {}", D[(st.wDayOfWeek as usize) % 7], st.wDay, MONTHS_ES[((st.wMonth as usize).max(1) - 1) % 12]);
-                        self.txt(self.font_big, &clock, cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 82.0 * s, fg, f, center);
-                        self.txt(self.font_small, &date, cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 102.0 * s, fg2, f, center);
-                        if self.batt.has {
-                            self.txt(self.font_small, &format!("{}%", self.batt.pct), cxm + 4.0 * s, y0 + 103.0 * s, cxm + 70.0 * s, y0 + 121.0 * s, fg2, f, left);
-                        }
-                        if self.feat(F_WEATHER) {
-                            let wx = self.wx.lock().unwrap().clone();
-                            if wx.state == 2 {
-                                let temp = format!("{}°", wx.temp.round());
-                                self.txt(self.font_main, &temp, cxm - 70.0 * s, y0 + 118.0 * s, cxm - 16.0 * s, y0 + 142.0 * s, fg, f, right);
-                                self.txt(self.font_small, wx.condition(), cxm - 8.0 * s, y0 + 120.0 * s, cxm + 100.0 * s, y0 + 140.0 * s, fg, f, left);
-                                self.txt(self.font_small, &wx.place, cxm - 100.0 * s, y0 + 140.0 * s, cxm + 100.0 * s, y0 + 156.0 * s, fg2, f, center);
+                        let wx = self.wx.lock().unwrap().clone();
+                        let wx_ready = self.feat(F_WEATHER) && wx.state == 2;
+                        if wx_ready {
+                            let half = self.cur[0] / 2.0;
+                            let left_cx = cxm - (half * s) / 2.0;
+                            let right_text = cxm + 85.0 * s;
+                            self.txt(self.font_big, &clock, left_cx - 130.0 * s, y0 + 42.0 * s, left_cx + 130.0 * s, y0 + 94.0 * s, fg, f, center);
+                            self.txt(self.font_small, &date, left_cx - 130.0 * s, y0 + 98.0 * s, left_cx + 130.0 * s, y0 + 118.0 * s, fg2, f, center);
+                            if self.batt.has {
+                                self.txt(self.font_small, &format!("{}%", self.batt.pct), left_cx + 4.0 * s, y0 + 124.0 * s, left_cx + 70.0 * s, y0 + 142.0 * s, fg2, f, left);
+                            }
+                            let temp = format!("{}°", wx.temp.round());
+                            self.txt(self.font_big, &temp, right_text, y0 + 48.0 * s, right_text + 110.0 * s, y0 + 80.0 * s, fg, f, left);
+                            self.txt(self.font_small, wx.condition(), right_text, y0 + 84.0 * s, right_text + 190.0 * s, y0 + 102.0 * s, fg, f, left);
+                            self.txt(self.font_small, &wx.place, right_text, y0 + 104.0 * s, right_text + 190.0 * s, y0 + 122.0 * s, fg2, f, left);
+                        } else {
+                            self.txt(self.font_big, &clock, cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 82.0 * s, fg, f, center);
+                            self.txt(self.font_small, &date, cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 102.0 * s, fg2, f, center);
+                            if self.batt.has {
+                                self.txt(self.font_small, &format!("{}%", self.batt.pct), cxm + 4.0 * s, y0 + 103.0 * s, cxm + 70.0 * s, y0 + 121.0 * s, fg2, f, left);
                             }
                         }
                     }
@@ -4153,39 +4219,42 @@ impl App {
                             self.txt(self.font_small, &d.to_string(), x, y, x + 40.0 * s, y + 24.0 * s, color, f, center);
                         }
                     }
-                    Page::Time => match self.time_tab {
-                        0 => {
-                            let head = format!("{} · {}", self.pomo_phase_name(), self.pomo_round_text());
-                            self.txt(self.font_small, &head, cxm - 200.0 * s, y0 + 64.0 * s, cxm + 200.0 * s, y0 + 82.0 * s, fg2, f, center);
-                            let col = if self.pomo_end.is_some() {
-                                if self.pomo_phase == 0 { accent } else { th.good }
-                            } else if self.pomo_paused.is_some() {
-                                fg2
-                            } else {
-                                fg
-                            };
-                            self.txt(self.font_big, &fmt_timer(self.pomo_secs()), cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 130.0 * s, col, f, center);
-                        }
-                        1 => {
-                            let col = if self.timer_end.is_some() {
-                                accent
-                            } else if self.timer_paused.is_some() {
-                                fg2
-                            } else {
-                                fg
-                            };
-                            self.txt(self.font_big, &fmt_timer(self.timer_secs()), cxm - 150.0 * s, y0 + 64.0 * s, cxm + 150.0 * s, y0 + 110.0 * s, col, f, center);
-                        }
-                        _ => {
-                            self.txt(self.font_big, &fmt_sw(self.sw_elapsed()), cxm - 150.0 * s, y0 + 64.0 * s, cxm + 150.0 * s, y0 + 112.0 * s, fg, f, center);
-                            let n = self.laps.len();
-                            if n > 0 {
-                                let prev = if n >= 2 { self.laps[n - 2] } else { 0.0 };
-                                let line = format!("Vuelta {} · {}", n, fmt_sw(self.laps[n - 1] - prev));
-                                self.txt(self.font_small, &line, cxm - 150.0 * s, y0 + 112.0 * s, cxm + 150.0 * s, y0 + 128.0 * s, fg2, f, center);
+                    Page::Time => {
+                        let ccx = cxm + 99.0 * s;
+                        match self.time_tab {
+                            0 => {
+                                let head = format!("{} · {}", self.pomo_phase_name(), self.pomo_round_text());
+                                self.txt(self.font_small, &head, ccx - 180.0 * s, y0 + 52.0 * s, ccx + 180.0 * s, y0 + 72.0 * s, fg2, f, center);
+                                let col = if self.pomo_end.is_some() {
+                                    if self.pomo_phase == 0 { accent } else { th.good }
+                                } else if self.pomo_paused.is_some() {
+                                    fg2
+                                } else {
+                                    fg
+                                };
+                                self.txt(self.font_big, &fmt_timer(self.pomo_secs()), ccx - 150.0 * s, y0 + 72.0 * s, ccx + 150.0 * s, y0 + 128.0 * s, col, f, center);
+                            }
+                            1 => {
+                                let col = if self.timer_end.is_some() {
+                                    accent
+                                } else if self.timer_paused.is_some() {
+                                    fg2
+                                } else {
+                                    fg
+                                };
+                                self.txt(self.font_big, &fmt_timer(self.timer_secs()), ccx - 150.0 * s, y0 + 52.0 * s, ccx + 150.0 * s, y0 + 110.0 * s, col, f, center);
+                            }
+                            _ => {
+                                self.txt(self.font_big, &fmt_sw(self.sw_elapsed()), ccx - 150.0 * s, y0 + 52.0 * s, ccx + 150.0 * s, y0 + 110.0 * s, fg, f, center);
+                                let n = self.laps.len();
+                                if n > 0 {
+                                    let prev = if n >= 2 { self.laps[n - 2] } else { 0.0 };
+                                    let line = format!("Vuelta {} · {}", n, fmt_sw(self.laps[n - 1] - prev));
+                                    self.txt(self.font_small, &line, ccx - 150.0 * s, y0 + 112.0 * s, ccx + 150.0 * s, y0 + 128.0 * s, fg2, f, center);
+                                }
                             }
                         }
-                    },
+                    }
                     Page::Calc => {
                         let line = if self.calc_done {
                             self.calc_prev.clone()
@@ -4309,6 +4378,7 @@ impl App {
                             let col = if wd.on { fg } else { fg2 };
                             self.txt(self.font_small, wd.label, l, t, r, b, col, f, center);
                         }
+                        WKind::Lyric => {}
                         WKind::Key(cls) => {
                             let col = match cls {
                                 0 => fg,
