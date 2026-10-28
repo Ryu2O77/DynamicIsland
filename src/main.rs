@@ -6,6 +6,7 @@
 //! proximidad, fuente elegible. Configuracion en %APPDATA%\DynamicIsland\config.ini.
 
 mod capture;
+mod mixer;
 mod system;
 mod weather;
 
@@ -23,6 +24,7 @@ use windows::Graphics::Imaging::{
     ExifOrientationMode,
 };
 use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession as MSession,
     GlobalSystemMediaTransportControlsSessionManager as Manager,
     GlobalSystemMediaTransportControlsSessionMediaProperties as MediaProps,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlayStatus,
@@ -54,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 // ------------------------------------------------------------ constantes
 
 const CW: f32 = 700.0; // lienzo (logico)
-const CH: f32 = 390.0;
+const CH: f32 = 430.0;
 const TOP: f32 = 8.0; // separacion con el borde superior (estilo isla)
 const EW: f32 = 440.0; // ancho de la isla expandida
 const EW_WIDE: f32 = 620.0; // ancho para las paginas horizontales (Tiempo y Reloj)
@@ -64,6 +66,8 @@ const WM_APP_MEDIA: u32 = 0x8000 + 1;
 const WM_TRAY: u32 = 0x8000 + 2;
 const WM_APP_FRAME: u32 = 0x8000 + 3;
 const WM_APP_WEATHER: u32 = 0x8000 + 4;
+const WM_APP_MIXER: u32 = 0x8000 + 9;
+const WM_APP_DEVMENU: u32 = 0x8000 + 10;
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 const MA_NOACTIVATE_: isize = 3;
 const MA_ACTIVATE_: isize = 1;
@@ -71,6 +75,7 @@ const MA_ACTIVATE_: isize = 1;
 const T_CLOCK: usize = 2;
 const T_VIS: usize = 3;
 const T_PROX: usize = 4;
+const DODGE_PX: f32 = 54.0; // cuanto baja la isla al esquivar las pestañas
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ANIM_ON: AtomicBool = AtomicBool::new(false);
@@ -218,7 +223,9 @@ const F_WEATHER: usize = 18;
 const F_SYSTEM: usize = 19;
 const F_CAPTURE: usize = 20;
 const F_REC_HIDE: usize = 21;
-const F_COUNT: usize = 22;
+const F_DODGE: usize = 22;
+const F_MIXER: usize = 23;
+const F_COUNT: usize = 24;
 
 // Pomodoro: enfoque 25 min, descanso corto 5 min y descanso largo 15 min cada 4 rondas.
 const POMO_WORK: u64 = 25 * 60;
@@ -249,12 +256,14 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("system", "Sistema"),
     ("capture", "Captura y grabación"),
     ("rechide", "Ocultar al grabar"),
+    ("dodge", "Esquivar pestañas del navegador"),
+    ("mixer", "Mezclador de volumen"),
 ];
 
 // que funciones salen en la pestaña "Funciones" de Ajustes
-const FUNC_LIST: [usize; 14] = [
+const FUNC_LIST: [usize; 15] = [
     F_MUSIC, F_LYRICS, F_LYRMODE, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF,
-    F_BATT, F_WEATHER, F_SYSTEM, F_CAPTURE,
+    F_BATT, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER,
 ];
 
 fn pomo_dur(phase: u8) -> u64 {
@@ -288,6 +297,7 @@ struct Cfg {
     wx_lon: f32,
     wx_unit: u8, // 0 °C, 1 °F
     lyrics_open: bool,
+    source: String,
 }
 
 impl Default for Cfg {
@@ -305,6 +315,7 @@ impl Default for Cfg {
             wx_lon: 0.0,
             wx_unit: 0,
             lyrics_open: false,
+            source: String::new(),
         }
     }
 }
@@ -326,6 +337,7 @@ struct Media {
     dur: f64,
     stamp: Option<Instant>,
     cover: Option<Arc<Cover>>,
+    source: String, // aplicacion de la que vienen los controles (Spotify, Chrome...)
 }
 
 impl Media {
@@ -346,6 +358,7 @@ impl Media {
 
 fn differs(a: &Media, b: &Media) -> bool {
     a.has != b.has
+        || a.source != b.source
         || a.playing != b.playing
         || a.title != b.title
         || a.artist != b.artist
@@ -393,6 +406,7 @@ enum Page {
     Calendar,
     Weather,
     Time,
+    Mixer,
     Calc,
     Todo,
     System,
@@ -451,6 +465,9 @@ enum Act {
     RecToggle,
     OpenShots,
     OpenVideos,
+    MixMute(usize),
+    MixDevice(usize),
+    Source,
     ResetPos,
 }
 
@@ -467,6 +484,8 @@ enum WKind {
     Bar,
     Chip,
     Lyric,
+    Mute,
+    Source,
     Selector,
     Slider,
     Arrow(i8),
@@ -569,6 +588,10 @@ struct App {
     animating: bool,
     vis_on: bool,
     prox_on: bool,
+    dodge: f32,        // desplazamiento vertical actual (px logicos)
+    dodge_target: f32,
+    edge_since: Option<Instant>,
+    away_since: Option<Instant>,
     hidden: bool,
     last: Instant,
     t0: Instant,
@@ -615,6 +638,9 @@ struct App {
     sys_cpu_hist: Vec<f32>,
     sys_ram_hist: Vec<f32>,
     recorder: Option<capture::Recorder>,
+    mixer: Option<mixer::Mixer>,
+    mix_override: f32, // valor mostrado mientras se arrastra un deslizador del mezclador
+    mix_last: f32,
     rec_hidden: bool,
     last_shot: String,
     last_video: String,
@@ -648,6 +674,7 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
     let mut f = [true; F_COUNT];
     f[F_PROX] = false; // la opacidad por proximidad es opt-in
     f[F_LYRMODE] = false; // la letra en la isla es opt-in
+    f[F_DODGE] = false; // esquivar pestañas es opt-in
     let mut cfg = Cfg::default();
     if let Some(d) = data_dir() {
         if let Ok(txt) = std::fs::read_to_string(d.join("config.ini")) {
@@ -672,6 +699,7 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
                         "wx_lon" => cfg.wx_lon = v.parse::<f32>().unwrap_or(0.0),
                         "wx_unit" => cfg.wx_unit = v.parse::<u8>().unwrap_or(0).min(1),
                         "lyrics_open" => cfg.lyrics_open = v != "0",
+                        "source" => cfg.source = v.to_string(),
                         _ => {}
                     }
                 }
@@ -700,6 +728,7 @@ fn save_config(f: &[bool; F_COUNT], cfg: &Cfg) {
             cfg.wx_unit,
             if cfg.lyrics_open { 1 } else { 0 }
         ));
+        s.push_str(&format!("source={}\n", cfg.source.replace(['\n', '\r'], " ").trim()));
         let _ = std::fs::write(d.join("config.ini"), s);
     }
 }
@@ -1051,6 +1080,97 @@ fn fetch_cover(props: &MediaProps) -> windows::core::Result<Cover> {
     Ok(Cover { px, accent })
 }
 
+// ---- fuente de los controles de medios (Spotify, navegador, foobar...)
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SourceInfo {
+    id: String,
+    name: String,
+    playing: bool,
+}
+
+/// Aplicacion elegida (vacio = automatico: la sesion actual de Windows).
+static SOURCE_SEL: Mutex<String> = Mutex::new(String::new());
+static SOURCES: Mutex<Vec<SourceInfo>> = Mutex::new(Vec::new());
+static MEDIA_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+fn friendly_source(id: &str) -> String {
+    if id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return "Firefox".to_string();
+    }
+    let base = id.rsplit('!').next().unwrap_or(id);
+    let base = base.trim_end_matches(".exe").trim_end_matches(".EXE");
+    let low = base.to_lowercase();
+    const KNOWN: [(&str, &str); 14] = [
+        ("spotify", "Spotify"),
+        ("chrome", "Chrome"),
+        ("msedge", "Edge"),
+        ("firefox", "Firefox"),
+        ("brave", "Brave"),
+        ("opera", "Opera"),
+        ("vivaldi", "Vivaldi"),
+        ("vlc", "VLC"),
+        ("foobar", "foobar2000"),
+        ("musicbee", "MusicBee"),
+        ("itunes", "iTunes"),
+        ("zunemusic", "Reproductor"),
+        ("tidal", "TIDAL"),
+        ("deezer", "Deezer"),
+    ];
+    for (k, n) in KNOWN.iter() {
+        if low.contains(*k) {
+            return n.to_string();
+        }
+    }
+    let seg = base.rsplit('.').next().unwrap_or(base);
+    let mut ch = seg.chars();
+    match ch.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+        None => "Desconocido".to_string(),
+    }
+}
+
+/// Sesion elegida por el usuario; si no esta disponible, la actual de Windows.
+fn pick_session(mgr: &Manager) -> windows::core::Result<MSession> {
+    let sel = SOURCE_SEL.lock().unwrap().clone();
+    if !sel.is_empty() {
+        if let Ok(list) = mgr.GetSessions() {
+            for s in list {
+                if let Ok(id) = s.SourceAppUserModelId() {
+                    if id.to_string().eq_ignore_ascii_case(&sel) {
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+    }
+    mgr.GetCurrentSession()
+}
+
+/// Actualiza la lista de aplicaciones con controles de medios; true si cambio.
+fn update_sources(mgr: &Manager) -> bool {
+    let mut list: Vec<SourceInfo> = Vec::new();
+    if let Ok(sessions) = mgr.GetSessions() {
+        for s in sessions {
+            let Ok(idh) = s.SourceAppUserModelId() else { continue };
+            let id = idh.to_string();
+            let playing = s
+                .GetPlaybackInfo()
+                .and_then(|i| i.PlaybackStatus())
+                .map(|p| p == PlayStatus::Playing)
+                .unwrap_or(false);
+            list.push(SourceInfo { name: friendly_source(&id), id, playing });
+        }
+    }
+    let mut cur = SOURCES.lock().unwrap();
+    let changed = cur.len() != list.len() || cur.iter().zip(list.iter()).any(|(a, b)| a.id != b.id || a.playing != b.playing);
+    if changed {
+        *cur = list;
+    }
+    changed
+}
+
 struct Poller {
     mgr: Manager,
     key: (String, String),
@@ -1060,7 +1180,8 @@ struct Poller {
 
 impl Poller {
     fn poll(&mut self, cover_on: bool) -> windows::core::Result<Media> {
-        let s = self.mgr.GetCurrentSession()?;
+        let s = pick_session(&self.mgr)?;
+        let source = friendly_source(&s.SourceAppUserModelId().map(|h| h.to_string()).unwrap_or_default());
         let p = s.TryGetMediaPropertiesAsync()?.get()?;
         let title = p.Title()?.to_string();
         let artist = p.Artist()?.to_string();
@@ -1107,11 +1228,13 @@ impl Poller {
             dur,
             stamp: Some(Instant::now()),
             cover: self.cover.clone(),
+            source,
         })
     }
 }
 
 fn media_thread(hwnd: isize, media: Arc<Mutex<Media>>) {
+    let _ = MEDIA_THREAD.set(std::thread::current());
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
@@ -1135,12 +1258,13 @@ fn media_thread(hwnd: isize, media: Arc<Mutex<Media>>) {
             *m = new;
             c
         };
-        if changed {
+        let src_changed = if music { update_sources(&poller.mgr) } else { false };
+        if changed || src_changed {
             unsafe {
                 let _ = PostMessageW(HWND(hwnd as _), WM_APP_MEDIA, WPARAM(0), LPARAM(0));
             }
         }
-        std::thread::sleep(Duration::from_millis(if music { 700 } else { 1500 }));
+        std::thread::park_timeout(Duration::from_millis(if music { 700 } else { 1500 }));
     }
 }
 
@@ -1149,7 +1273,7 @@ fn media_cmd(cmd: Cmd) {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
         let run = || -> windows::core::Result<()> {
             let mgr = Manager::RequestAsync()?.get()?;
-            let s = mgr.GetCurrentSession()?;
+            let s = pick_session(&mgr)?;
             match cmd {
                 Cmd::Prev => {
                     s.TrySkipPreviousAsync()?.get()?;
@@ -1515,6 +1639,21 @@ fn fmt_sw(secs: f64) -> String {
 
 // ------------------------------------------------------------ dibujo: extras
 
+impl<'a> Canvas<'a> {
+    /// Altavoz; con `muted` se dibuja una cruz en lugar de las ondas.
+    fn speaker(&mut self, cx: f32, cy: f32, s: f32, col: Rgb, muted: bool, f: f32) {
+        self.rrect(cx - 7.5 * s, cy - 2.5 * s, 3.5 * s, 5.0 * s, 0.8 * s, col, f);
+        self.poly(&[(cx - 4.2 * s, cy - 2.5 * s), (cx + 0.8 * s, cy - 6.0 * s), (cx + 0.8 * s, cy + 6.0 * s), (cx - 4.2 * s, cy + 2.5 * s)], col, f);
+        if muted {
+            self.line(cx + 3.0 * s, cy - 3.0 * s, cx + 8.0 * s, cy + 3.0 * s, 1.6 * s, col, f);
+            self.line(cx + 3.0 * s, cy + 3.0 * s, cx + 8.0 * s, cy - 3.0 * s, 1.6 * s, col, f);
+        } else {
+            self.rrect(cx + 3.2 * s, cy - 2.6 * s, 1.5 * s, 5.2 * s, 0.75 * s, col, f);
+            self.rrect(cx + 6.0 * s, cy - 4.8 * s, 1.5 * s, 9.6 * s, 0.75 * s, col, f);
+        }
+    }
+}
+
 fn pack(c: Rgb) -> u32 {
     ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | (c.2 as u32)
 }
@@ -1791,6 +1930,7 @@ impl<'a> Canvas<'a> {
                     self.rrect(cx - 6.5 * s + i as f32 * 3.4 * s, cy + 5.0 * s - h * s, 2.2 * s, h * s, 0.8 * s, col, f);
                 }
             }
+            Page::Mixer => self.speaker(cx, cy, s, col, false, f),
             Page::Capture => {
                 self.rrect(cx - 7.0 * s, cy - 4.0 * s, 14.0 * s, 10.0 * s, 2.2 * s, col, f);
                 self.rrect(cx - 2.8 * s, cy - 6.5 * s, 5.6 * s, 3.0 * s, 1.0 * s, col, f);
@@ -1858,6 +1998,7 @@ impl App {
             Page::Todo => self.feat(F_TODO),
             Page::System => self.feat(F_SYSTEM),
             Page::Capture => self.feat(F_CAPTURE),
+            Page::Mixer => self.feat(F_MIXER),
             Page::Settings => true,
         }
     }
@@ -1894,7 +2035,7 @@ impl App {
 
     /// Letra sincronizada lista para mostrarse en la isla colapsada.
     fn lyric_ready(&self, m: &Media) -> bool {
-        if !self.feat(F_LYRMODE) || !m.has {
+        if !self.feat(F_LYRMODE) || !self.cfg.lyrics_open || !m.has {
             return false;
         }
         let l = self.lyrics.lock().unwrap();
@@ -2047,11 +2188,13 @@ impl App {
                     }
                 }
                 Page::Clock => {
+                    // compacto: hora y clima en una sola fila
                     let wx_ready = self.feat(F_WEATHER) && self.wx.lock().unwrap().state == 2;
+                    let h = if self.batt.has { 124.0 } else { 104.0 };
                     if wx_ready {
-                        (EW_WIDE, 170.0)
+                        (480.0, h)
                     } else {
-                        (EW, 128.0)
+                        (EW, h)
                     }
                 }
                 Page::Calendar => (EW, 244.0),
@@ -2061,10 +2204,14 @@ impl App {
                 Page::Weather => (EW, 250.0),
                 Page::System => (EW, 240.0),
                 Page::Capture => (EW, 210.0),
+                Page::Mixer => {
+                    let n = self.mixer.as_ref().map(|mx| mx.state().apps.len()).unwrap_or(0).clamp(1, 6) as f32;
+                    (EW, 88.0 + n * 30.0)
+                }
                 Page::Settings => match self.settings_tab {
-                    0 => (EW, 308.0),
+                    0 => (EW, 338.0),
                     1 => (EW, 278.0),
-                    2 => (EW, 338.0),
+                    2 => (EW, 362.0),
                     _ => (EW, 188.0),
                 },
             },
@@ -2123,10 +2270,22 @@ impl App {
         if new != Mode::Expanded {
             self.hover_act = None;
         }
-        if (new == Mode::Expanded && self.page == Page::Music && self.cfg.lyrics_open)
-            || self.feat(F_LYRMODE)
+        // las letras solo se buscan cuando se activan con el icono
+        if self.cfg.lyrics_open
+            && (self.feat(F_LYRMODE) || (new == Mode::Expanded && self.page == Page::Music && self.feat(F_LYRICS)))
         {
             self.check_lyrics();
+        }
+        // mezclador: solo consulta mientras su pestaña esta visible
+        if new == Mode::Expanded && self.page == Page::Mixer && self.feat(F_MIXER) {
+            if self.mixer.is_none() {
+                self.mixer = Some(mixer::Mixer::start(self.hwnd.0 as isize, WM_APP_MIXER));
+            }
+            if let Some(mx) = &self.mixer {
+                mx.set_active(true);
+            }
+        } else if let Some(mx) = &self.mixer {
+            mx.set_active(false);
         }
         self.start_anim();
     }
@@ -2239,6 +2398,14 @@ impl App {
         } else {
             self.opacity = self.opacity_target;
         }
+        // esquivar pestañas (desplazamiento vertical suavizado)
+        let kd = 1.0 - (-dt * 12.0).exp();
+        self.dodge += (self.dodge_target - self.dodge) * kd;
+        if (self.dodge_target - self.dodge).abs() > 0.3 {
+            settled = false;
+        } else {
+            self.dodge = self.dodge_target;
+        }
         self.fade = (self.fade + dt / 0.25).min(1.0);
         if self.fade < 1.0 {
             settled = false;
@@ -2276,11 +2443,95 @@ impl App {
         }
     }
 
+    /// Posicion real de la ventana (con el desplazamiento de esquivar).
+    fn win_pos(&self) -> POINT {
+        POINT { x: self.pos.x, y: self.pos.y + (self.dodge * self.s) as i32 }
+    }
+
+    /// El mismo temporizador sirve para la opacidad por proximidad y para esquivar.
+    fn sync_poll_timer(&mut self) {
+        let need = self.feat(F_PROX) || self.feat(F_DODGE);
+        unsafe {
+            if need && !self.prox_on {
+                SetTimer(self.hwnd, T_PROX, 100, None);
+                self.prox_on = true;
+            } else if !need && self.prox_on {
+                let _ = KillTimer(self.hwnd, T_PROX);
+                self.prox_on = false;
+            }
+        }
+    }
+
+    /// Si el mouse se queda 1 s en el borde superior sobre la isla, esta baja un poco
+    /// para dejar libres las pestañas del navegador; vuelve cuando el mouse se aleja.
+    fn dodge_tick(&mut self) {
+        if !self.feat(F_DODGE) || self.drag.is_some() || self.slider_drag.is_some() || self.editing {
+            self.edge_since = None;
+            self.away_since = None;
+            if self.dodge_target != 0.0 {
+                self.dodge_target = 0.0;
+                self.start_anim();
+            }
+            return;
+        }
+        let s = self.s;
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        let (x0, _y0, w, _h) = self.pill_rect();
+        let (l, r) = (self.pos.x as f32 + x0 - 48.0 * s, self.pos.x as f32 + x0 + w + 48.0 * s);
+        let (px, py) = (p.x as f32, p.y as f32);
+        let in_x = px >= l && px <= r;
+        let at_top = (self.pos.y - self.home.y) as f32 <= 30.0 * s; // la isla esta arriba del todo
+        let top_y = self.home.y as f32;
+        let now = Instant::now();
+        // el hover puede quedar desfasado cuando la ventana se mueve bajo un mouse quieto
+        if self.hover && !self.pinned {
+            let wp = self.win_pos();
+            let (qx, qy, qw, qh) = self.pill_rect();
+            let (sx, sy) = (wp.x as f32 + qx, wp.y as f32 + qy);
+            let inside = px >= sx - 2.0 && px <= sx + qw + 2.0 && py >= sy - 2.0 && py <= sy + qh + 2.0;
+            if !inside {
+                self.set_hover(false);
+            }
+        }
+        if self.dodge_target == 0.0 {
+            // en notch la isla ya esta pegada al borde: basta con tener el mouse en la fila superior
+            let can = self.notch() || (!self.hover && self.mode == Mode::Collapsed);
+            let edge = in_x && at_top && py <= top_y + 1.5 && can;
+            if edge {
+                let t0 = *self.edge_since.get_or_insert(now);
+                if now.duration_since(t0) >= Duration::from_millis(1000) {
+                    self.dodge_target = DODGE_PX;
+                    self.edge_since = None;
+                    self.away_since = None;
+                    self.start_anim();
+                }
+            } else {
+                self.edge_since = None;
+            }
+        } else {
+            let in_tabs = in_x && py <= top_y + (DODGE_PX + 6.0) * s;
+            if in_tabs || self.hover || self.pinned {
+                self.away_since = None;
+            } else {
+                let t0 = *self.away_since.get_or_insert(now);
+                if now.duration_since(t0) >= Duration::from_millis(600) {
+                    self.dodge_target = 0.0;
+                    self.away_since = None;
+                    self.start_anim();
+                }
+            }
+        }
+    }
+
     /// Opacidad segun la distancia del cursor a la isla.
     fn prox_tick(&mut self) {
         if self.hidden {
             return;
         }
+        self.dodge_tick();
         let target = if !self.feat(F_PROX) {
             1.0
         } else {
@@ -2289,7 +2540,8 @@ impl App {
                 let _ = GetCursorPos(&mut p);
             }
             let (x0, y0, w, h) = self.pill_rect();
-            let (l, t) = (self.pos.x as f32 + x0, self.pos.y as f32 + y0);
+            let wp = self.win_pos();
+            let (l, t) = (wp.x as f32 + x0, wp.y as f32 + y0);
             let (px, py) = (p.x as f32, p.y as f32);
             let dx = (l - px).max(px - (l + w)).max(0.0);
             let dy = (t - py).max(py - (t + h)).max(0.0);
@@ -2618,7 +2870,10 @@ impl App {
         }
         let (x0, y0, w, h) = self.pill_rect();
         let (fx, fy) = (x as f32, y as f32);
-        let inside = fx >= x0 - 2.0 && fx <= x0 + w + 2.0 && fy >= y0 - 2.0 && fy <= y0 + h + 2.0;
+        let mut inside = fx >= x0 - 2.0 && fx <= x0 + w + 2.0 && fy >= y0 - 2.0 && fy <= y0 + h + 2.0;
+        if inside && self.notch() && self.feat(F_DODGE) && self.dodge_target == 0.0 && self.dodge < 0.5 && fy <= 1.0 {
+            inside = false;
+        }
         if inside != self.hover {
             self.set_hover(inside);
         } else if inside {
@@ -2660,6 +2915,7 @@ impl App {
         if let Some(wd) = self.hit(x, y) {
             if let Act::Slider(id) = wd.act {
                 self.slider_drag = Some(id);
+                self.mix_last = -1.0;
                 unsafe {
                     SetCapture(self.hwnd);
                 }
@@ -2676,6 +2932,10 @@ impl App {
                     let _ = GetCursorPos(&mut p);
                     SetCapture(self.hwnd);
                 }
+                // si estaba esquivando, arrancar desde la posicion visible
+                self.pos = self.win_pos();
+                self.dodge = 0.0;
+                self.dodge_target = 0.0;
                 self.drag = Some(DragState { c0: p, p0: self.pos, moved: false });
             }
         }
@@ -2708,6 +2968,27 @@ impl App {
         if let Some(wd) = found {
             let (tx, tw) = (wd.x + 8.0 * s, wd.w - 16.0 * s);
             let frac = ((x - tx) / tw).clamp(0.0, 1.0);
+            if id >= 10 {
+                // mezclador de volumen
+                self.mix_override = frac;
+                if let Some(mx) = &self.mixer {
+                    if (frac - self.mix_last).abs() >= 0.01 || frac <= 0.0 || frac >= 1.0 {
+                        self.mix_last = frac;
+                        if id == 10 {
+                            mx.set_master(frac);
+                        } else {
+                            let st = mx.state();
+                            if let Some(a) = st.apps.get((id - 11) as usize) {
+                                mx.set_app(&a.name, frac);
+                            }
+                        }
+                    }
+                }
+                if !self.animating {
+                    self.render();
+                }
+                return;
+            }
             if id == 0 {
                 self.cfg.op_min = 0.1 + 0.8 * frac;
             } else {
@@ -2869,6 +3150,34 @@ impl App {
         });
     }
 
+    /// Indice (1..) de la aplicacion del mezclador bajo el cursor, para el clic derecho.
+    fn mixer_hit(&self, x: i32, y: i32) -> Option<usize> {
+        if self.mode != Mode::Expanded || self.page != Page::Mixer {
+            return None;
+        }
+        let m = self.media.lock().unwrap().clone();
+        let (fx, fy) = (x as f32, y as f32);
+        for wd in self.layout(self.mode, self.page, &m) {
+            if fx >= wd.x && fx < wd.x + wd.w && fy >= wd.y && fy < wd.y + wd.h {
+                match wd.act {
+                    Act::MixMute(i) if i > 0 => return Some(i),
+                    Act::MixDevice(i) => return Some(i),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    fn on_mixer(&mut self) {
+        if self.mode == Mode::Expanded && self.page == Page::Mixer {
+            self.start_anim();
+            if !self.animating {
+                self.render();
+            }
+        }
+    }
+
     fn on_weather(&mut self) {
         let w = self.wx.lock().unwrap().clone();
         if w.state == 2 {
@@ -3007,6 +3316,7 @@ impl App {
                 } else if p == Page::Time {
                     self.ensure_time_tab();
                 } else if p == Page::System {
+                    self.sys_sampler = system::Sampler::default();
                     let st = self.sys_sampler.sample();
                     self.sys = st;
                     self.sys_cpu_hist.push((st.cpu / 100.0).clamp(0.0, 1.0));
@@ -3086,15 +3396,13 @@ impl App {
             Act::PomoSkip => {
                 self.pomo_end = None;
                 self.pomo_paused = None;
-                self.pomo_phase = if self.pomo_phase == 0 {
-                    if (self.pomo_round + 1) % 4 == 0 {
-                        2
-                    } else {
-                        1
-                    }
+                if self.pomo_phase == 0 {
+                    // saltar el enfoque cuenta como ronda completada
+                    self.pomo_round += 1;
+                    self.pomo_phase = if self.pomo_round % 4 == 0 { 2 } else { 1 };
                 } else {
-                    0
-                };
+                    self.pomo_phase = 0;
+                }
             }
             Act::TimeTab(tab) => {
                 if self.time_tab_enabled(tab) {
@@ -3226,6 +3534,42 @@ impl App {
             }
             Act::OpenShots => open_folder(&capture::pictures_dir()),
             Act::OpenVideos => open_folder(&capture::videos_dir()),
+            Act::MixMute(i) => {
+                if let Some(mx) = &self.mixer {
+                    let st = mx.state();
+                    if i == 0 {
+                        mx.set_master_mute(!st.muted);
+                    } else if let Some(a) = st.apps.get(i - 1) {
+                        mx.set_app_mute(&a.name, !a.muted);
+                    }
+                }
+            }
+            Act::MixDevice(i) => {
+                // el menu se abre fuera del prestamo de `APP` (ver WM_APP_DEVMENU)
+                unsafe {
+                    let _ = PostMessageW(self.hwnd, WM_APP_DEVMENU, WPARAM(i), LPARAM(0));
+                }
+                return;
+            }
+            Act::Source => {
+                let list = SOURCES.lock().unwrap().clone();
+                let cur = SOURCE_SEL.lock().unwrap().clone();
+                let first = list.first().map(|x| x.id.clone()).unwrap_or_default();
+                let next = if cur.is_empty() {
+                    first
+                } else {
+                    match list.iter().position(|x| x.id.eq_ignore_ascii_case(&cur)) {
+                        Some(i) => list.get(i + 1).map(|x| x.id.clone()).unwrap_or_default(),
+                        None => first,
+                    }
+                };
+                *SOURCE_SEL.lock().unwrap() = next.clone();
+                self.cfg.source = next;
+                save_config(&self.features, &self.cfg);
+                if let Some(t) = MEDIA_THREAD.get() {
+                    t.unpark();
+                }
+            }
             Act::ResetPos => {
                 self.cfg.dx = 0;
                 self.cfg.dy = 0;
@@ -3279,20 +3623,26 @@ impl App {
                     }
                 }
             }
-            F_PROX => unsafe {
-                if on && !self.prox_on {
-                    SetTimer(self.hwnd, T_PROX, 150, None);
-                    self.prox_on = true;
+            F_PROX => {
+                self.sync_poll_timer();
+                if on {
                     self.prox_tick();
-                } else if !on {
-                    if self.prox_on {
-                        let _ = KillTimer(self.hwnd, T_PROX);
-                        self.prox_on = false;
-                    }
+                } else {
                     self.opacity_target = 1.0;
                     self.start_anim();
                 }
-            },
+            }
+            F_DODGE => {
+                self.sync_poll_timer();
+                if !on {
+                    self.edge_since = None;
+                    self.away_since = None;
+                    if self.dodge_target != 0.0 {
+                        self.dodge_target = 0.0;
+                        self.start_anim();
+                    }
+                }
+            }
             F_WEATHER => {
                 if on {
                     self.ensure_weather();
@@ -3304,8 +3654,15 @@ impl App {
                 }
             }
             F_CAPTURE => {
-                if !on && self.recorder.is_some() {
-                    self.stop_recording();
+                if on {
+                    if !register_hotkeys(self.hwnd) {
+                        self.show_toast(false, "Atajo ocupado: usa el menú de la bandeja".into(), 6);
+                    }
+                } else {
+                    unregister_hotkeys(self.hwnd);
+                    if self.recorder.is_some() {
+                        self.stop_recording();
+                    }
                 }
             }
             _ => {}
@@ -3507,12 +3864,13 @@ impl App {
         let half = self.cur[0] / 2.0;
 
         // barra de pestañas (iconos; la activa muestra su nombre)
-        const TABS: [(Page, &str, f32); 10] = [
+        const TABS: [(Page, &str, f32); 11] = [
             (Page::Music, "Música", 46.0),
             (Page::Clock, "Reloj", 36.0),
             (Page::Calendar, "Cal.", 30.0),
             (Page::Weather, "Clima", 38.0),
             (Page::Time, "Tiempo", 46.0),
+            (Page::Mixer, "Volumen", 48.0),
             (Page::Calc, "Calc", 32.0),
             (Page::Todo, "Tareas", 44.0),
             (Page::System, "Sistema", 46.0),
@@ -3545,6 +3903,7 @@ impl App {
                     v.push(Widget::new(cx - 22.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Big(big), Act::Toggle, ""));
                     v.push(Widget::new(cx + 40.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Next), Act::Next, ""));
                     v.push(Widget::new(cx - 156.0 * s, y0 + 98.0 * s, 312.0 * s, 20.0 * s, WKind::Bar, Act::Seek(0.0), ""));
+                    v.push(Widget::new(cx - 206.0 * s, yc - 11.0 * s, 118.0 * s, 22.0 * s, WKind::Source, Act::Source, ""));
                     if self.feat(F_LYRICS) || self.feat(F_LYRMODE) {
                         v.push(
                             Widget::new(cx + 96.0 * s, y0 + 121.0 * s, 26.0 * s, 26.0 * s, WKind::Lyric, Act::Lyrics, "")
@@ -3704,6 +4063,7 @@ impl App {
                         v.push(
                             Widget::new(cx - 200.0 * s, y7, 400.0 * s, rh, WKind::Toggle, Act::Autostart, "Iniciar con Windows").on(self.autostart),
                         );
+                        toggle(&mut v, 8.0, F_DODGE);
                     }
                     _ => {
                         const UNITS: [&str; 2] = ["°C (métrico)", "°F (imperial)"];
@@ -3722,6 +4082,21 @@ impl App {
                 }
             }
             Page::Weather | Page::System | Page::Clock => {}
+            Page::Mixer => {
+                let st = self.mixer.as_ref().map(|mx| mx.state()).unwrap_or_default();
+                let row = |v: &mut Vec<Widget>, y: f32, mute_id: usize, slider_id: u8, val: f32, muted: bool| {
+                    v.push(Widget::new(cx - 200.0 * s, y, 26.0 * s, 26.0 * s, WKind::Mute, Act::MixMute(mute_id), "").on(muted));
+                    v.push(Widget::new(cx - 58.0 * s, y, 214.0 * s, 26.0 * s, WKind::Slider, Act::Slider(slider_id), "").val(val));
+                };
+                let ov = |id: u8, real: f32| if self.slider_drag == Some(id) { self.mix_override } else { real };
+                row(&mut v, y0 + 42.0 * s, 0, 10, ov(10, st.master), st.muted);
+                for (i, a) in st.apps.iter().take(6).enumerate() {
+                    let y = y0 + 82.0 * s + i as f32 * 30.0 * s;
+                    row(&mut v, y, i + 1, 11 + i as u8, ov(11 + i as u8, a.vol), a.muted);
+                    // clic en el nombre (o clic derecho en nombre/silencio): salida de audio de la app
+                    v.push(Widget::new(cx - 170.0 * s, y, 110.0 * s, 26.0 * s, WKind::Selector, Act::MixDevice(i + 1), ""));
+                }
+            }
             Page::Capture => {
                 v.push(Widget::new(cx - 196.0 * s, y0 + 42.0 * s, 186.0 * s, 32.0 * s, WKind::Pill, Act::Shot, "Captura de pantalla"));
                 let rec = if self.recorder.is_some() { "Detener" } else { "Grabar pantalla" };
@@ -3886,6 +4261,17 @@ impl App {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, rr, th.surface, f);
                     }
                 }
+                WKind::Mute => {
+                    if hov {
+                        cv.circle(cx, cy, 13.0 * s, th.fg, 0.08 * f);
+                    }
+                    let col = if wd.on { th.accent } else if hov { th.fg } else { th.fg2 };
+                    cv.speaker(cx, cy, s, col, wd.on, f);
+                }
+                WKind::Source => {
+                    let c2 = if hov { th.surface_hi } else { th.surface };
+                    cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), c2, f);
+                }
                 WKind::Bar | WKind::Label => {}
             }
         }
@@ -3955,22 +4341,13 @@ impl App {
                     Page::Clock => {
                         let wx = self.wx.lock().unwrap().clone();
                         let wx_ready = self.feat(F_WEATHER) && wx.state == 2;
+                        let lcx = if wx_ready { cxm - 118.0 * s } else { cxm };
                         if wx_ready {
-                            let half = self.cur[0] / 2.0;
-                            cv.rrect(cxm - 0.5 * s, y0 + 42.0 * s, 1.0 * s, 104.0 * s, 0.5 * s, th.fg, 0.10 * f);
-                            if self.batt.has {
-                                cv.battery(cxm - (half * s) / 2.0 - 34.0 * s, y0 + 126.0 * s, s, self.batt, f);
-                            }
-                            cv.weather_icon(
-                                weather::icon_kind(wx.code),
-                                wx.is_day,
-                                cxm + 55.0 * s,
-                                y0 + 72.0 * s,
-                                14.0 * s,
-                                f,
-                            );
-                        } else if self.batt.has {
-                            cv.battery(cxm - 34.0 * s, y0 + 106.0 * s, s, self.batt, f);
+                            cv.rrect(cxm + 4.0 * s, y0 + 44.0 * s, 1.0 * s, 52.0 * s, 0.5 * s, th.fg, 0.10 * f);
+                            cv.weather_icon(weather::icon_kind(wx.code), wx.is_day, cxm + 40.0 * s, y0 + 68.0 * s, 14.0 * s, f);
+                        }
+                        if self.batt.has {
+                            cv.battery(lcx - 34.0 * s, y0 + 99.0 * s, s, self.batt, f);
                         }
                     }
                     Page::Time => {
@@ -4173,25 +4550,18 @@ impl App {
                         let date = format!("{} {} de {}", D[(st.wDayOfWeek as usize) % 7], st.wDay, MONTHS_ES[((st.wMonth as usize).max(1) - 1) % 12]);
                         let wx = self.wx.lock().unwrap().clone();
                         let wx_ready = self.feat(F_WEATHER) && wx.state == 2;
+                        let lcx = if wx_ready { cxm - 118.0 * s } else { cxm };
+                        self.txt(self.font_big, &clock, lcx - 110.0 * s, y0 + 38.0 * s, lcx + 110.0 * s, y0 + 78.0 * s, fg, f, center);
+                        self.txt(self.font_small, &date, lcx - 110.0 * s, y0 + 78.0 * s, lcx + 110.0 * s, y0 + 96.0 * s, fg2, f, center);
+                        if self.batt.has {
+                            self.txt(self.font_small, &format!("{}%", self.batt.pct), lcx + 4.0 * s, y0 + 97.0 * s, lcx + 70.0 * s, y0 + 115.0 * s, fg2, f, left);
+                        }
                         if wx_ready {
-                            let half = self.cur[0] / 2.0;
-                            let left_cx = cxm - (half * s) / 2.0;
-                            let right_text = cxm + 85.0 * s;
-                            self.txt(self.font_big, &clock, left_cx - 130.0 * s, y0 + 42.0 * s, left_cx + 130.0 * s, y0 + 94.0 * s, fg, f, center);
-                            self.txt(self.font_small, &date, left_cx - 130.0 * s, y0 + 98.0 * s, left_cx + 130.0 * s, y0 + 118.0 * s, fg2, f, center);
-                            if self.batt.has {
-                                self.txt(self.font_small, &format!("{}%", self.batt.pct), left_cx + 4.0 * s, y0 + 124.0 * s, left_cx + 70.0 * s, y0 + 142.0 * s, fg2, f, left);
-                            }
+                            let rx = cxm + 62.0 * s;
                             let temp = format!("{}°", wx.temp.round());
-                            self.txt(self.font_big, &temp, right_text, y0 + 48.0 * s, right_text + 110.0 * s, y0 + 80.0 * s, fg, f, left);
-                            self.txt(self.font_small, wx.condition(), right_text, y0 + 84.0 * s, right_text + 190.0 * s, y0 + 102.0 * s, fg, f, left);
-                            self.txt(self.font_small, &wx.place, right_text, y0 + 104.0 * s, right_text + 190.0 * s, y0 + 122.0 * s, fg2, f, left);
-                        } else {
-                            self.txt(self.font_big, &clock, cxm - 150.0 * s, y0 + 36.0 * s, cxm + 150.0 * s, y0 + 82.0 * s, fg, f, center);
-                            self.txt(self.font_small, &date, cxm - 150.0 * s, y0 + 82.0 * s, cxm + 150.0 * s, y0 + 102.0 * s, fg2, f, center);
-                            if self.batt.has {
-                                self.txt(self.font_small, &format!("{}%", self.batt.pct), cxm + 4.0 * s, y0 + 103.0 * s, cxm + 70.0 * s, y0 + 121.0 * s, fg2, f, left);
-                            }
+                            self.txt(self.font_big, &temp, rx, y0 + 36.0 * s, rx + 110.0 * s, y0 + 68.0 * s, fg, f, left);
+                            self.txt(self.font_small, wx.condition(), rx, y0 + 68.0 * s, rx + 170.0 * s, y0 + 84.0 * s, fg, f, left);
+                            self.txt(self.font_small, &wx.place, rx, y0 + 84.0 * s, rx + 170.0 * s, y0 + 100.0 * s, fg2, f, left);
                         }
                     }
                     Page::Calendar => {
@@ -4343,6 +4713,25 @@ impl App {
                         }
                         self.txt(self.font_small, &up, cxm, y0 + 206.0 * s, rx, y0 + 224.0 * s, fg, f, right);
                     }
+                    Page::Mixer => {
+                        let st = self.mixer.as_ref().map(|mx| mx.state()).unwrap_or_default();
+                        let y = y0 + 42.0 * s;
+                        let pct = |v: f32| format!("{}%", (v * 100.0).round() as i32);
+                        let ov = |id: u8, real: f32| if self.slider_drag == Some(id) { self.mix_override } else { real };
+                        self.txt(self.font_small, "Volumen general", cxm - 168.0 * s, y, cxm - 62.0 * s, y + 26.0 * s, fg, f, left);
+                        self.txt(self.font_small, &pct(ov(10, st.master)), cxm + 160.0 * s, y, cxm + 208.0 * s, y + 26.0 * s, fg2, f, left);
+                        if !st.ok {
+                            self.txt(self.font_small, "Sin dispositivo de audio", cxm - 200.0 * s, y0 + 82.0 * s, cxm + 200.0 * s, y0 + 108.0 * s, fg2, f, center);
+                        } else if st.apps.is_empty() {
+                            self.txt(self.font_small, "Ninguna aplicación está usando audio", cxm - 200.0 * s, y0 + 82.0 * s, cxm + 200.0 * s, y0 + 108.0 * s, fg2, f, center);
+                        }
+                        for (i, a) in st.apps.iter().take(6).enumerate() {
+                            let yy = y0 + 82.0 * s + i as f32 * 30.0 * s;
+                            let col = if a.active { fg } else { fg2 };
+                            self.txt(self.font_small, &a.name, cxm - 168.0 * s, yy, cxm - 62.0 * s, yy + 26.0 * s, col, f, left);
+                            self.txt(self.font_small, &pct(ov(11 + i as u8, a.vol)), cxm + 160.0 * s, yy, cxm + 208.0 * s, yy + 26.0 * s, fg2, f, left);
+                        }
+                    }
                     Page::Capture => {
                         let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
                         if let Some(r) = &self.recorder {
@@ -4379,6 +4768,12 @@ impl App {
                             self.txt(self.font_small, wd.label, l, t, r, b, col, f, center);
                         }
                         WKind::Lyric => {}
+                        WKind::Source => {
+                            let auto = self.cfg.source.is_empty();
+                            let name = if m.source.is_empty() { "—".to_string() } else { m.source.clone() };
+                            let shown = if auto { format!("Auto · {}", name) } else { name };
+                            self.txt(self.font_small, &shown, l + 6.0 * s, t, r - 4.0 * s, b, fg2, f, center);
+                        }
                         WKind::Key(cls) => {
                             let col = match cls {
                                 0 => fg,
@@ -4393,7 +4788,8 @@ impl App {
                         WKind::Slider => {
                             let val = match wd.act {
                                 Act::Slider(0) => format!("{}%", (self.cfg.op_min * 100.0).round() as i32),
-                                _ => format!("{} px", self.cfg.prox_dist.round() as i32),
+                                Act::Slider(1) => format!("{} px", self.cfg.prox_dist.round() as i32),
+                                _ => String::new(),
                             };
                             self.txt(self.font_small, &val, r + 6.0 * s, t, r + 62.0 * s, b, fg2, f, left);
                         }
@@ -4448,7 +4844,9 @@ impl App {
         let (x0, y0, w, h) = self.pill_rect();
         let notch = self.notch();
         let r = if th.sharp { (3.0 * s).min(h / 2.0) } else { (h / 2.0).min(26.0 * s) };
-        let ext = if notch { 40.0 * s } else { 0.0 };
+        // al esquivar, el notch se despega: pierde las orejas y la parte oculta sobre la pantalla
+        let nk = if notch { (1.0 - self.dodge / DODGE_PX).clamp(0.0, 1.0) } else { 0.0 };
+        let ext = 40.0 * s * nk;
         let (sy, shh) = (y0 - ext, h + ext);
         let shape = Shape {
             cx: x0 + w / 2.0,
@@ -4456,12 +4854,12 @@ impl App {
             hx: w / 2.0 - r,
             hy: shh / 2.0 - r,
             r,
-            notch,
+            notch: notch && nk > 0.02,
             ex0: x0,
             ex1: x0 + w,
-            e: 14.0 * s,
+            e: 14.0 * s * nk,
         };
-        let e = if notch { shape.e } else { 0.0 };
+        let e = shape.e;
         let (cx, cy, hx, hy) = (shape.cx, shape.cy, shape.hx, shape.hy);
 
         let xa = ((x0 - e).floor() as i32 - 1).max(0) as usize;
@@ -4470,7 +4868,7 @@ impl App {
         let yb = ((y0 + h).ceil() as i32 + 1).clamp(0, ph as i32) as usize;
 
         // sombra (solo estilo isla; se salta el interior de la pildora)
-        let shadow_on = self.feat(F_SHADOW) && !notch;
+        let shadow_on = self.feat(F_SHADOW) && (!notch || self.dodge > 1.0);
         let (bl, off) = (20.0 * s, 5.0 * s);
         let (sxa, sxb, sya, syb) = if shadow_on {
             (
@@ -4508,7 +4906,7 @@ impl App {
         let bgp = pack(th.bg);
         let ix0 = ((x0 + 2.0 * s).ceil() as usize).min(xb);
         let ix1 = ((x0 + w - 2.0 * s).floor().max(0.0) as usize).min(xb);
-        let iy0 = if notch { 0 } else { ((y0 + r).ceil() as usize).min(yb) };
+        let iy0 = ((sy + r).ceil().max(0.0) as usize).min(yb);
         let iy1 = ((y0 + h - r).floor().max(0.0) as usize).min(yb);
         for y in ya..yb {
             if y >= iy0 && y < iy1 && ix0 < ix1 {
@@ -4585,6 +4983,7 @@ impl App {
         }
 
         unsafe {
+            let wpos = self.win_pos();
             let src = POINT { x: 0, y: 0 };
             let size = SIZE { cx: self.pw, cy: self.ph };
             let blend = BLENDFUNCTION {
@@ -4596,7 +4995,7 @@ impl App {
             let _ = UpdateLayeredWindow(
                 self.hwnd,
                 HDC::default(),
-                Some(&self.pos as *const POINT),
+                Some(&wpos as *const POINT),
                 Some(&size as *const SIZE),
                 self.mem,
                 Some(&src as *const POINT),
@@ -4676,13 +5075,77 @@ fn set_tray_tip(hwnd: HWND, tip: &str) {
     }
 }
 
+/// Ctrl+Alt+S captura y Ctrl+Alt+R graba/detiene. Devuelve false si alguno esta ocupado.
+fn register_hotkeys(hwnd: HWND) -> bool {
+    unsafe {
+        let mods = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_NOREPEAT.0);
+        let a = RegisterHotKey(hwnd, 1, mods, 'S' as u32).is_ok();
+        let b = RegisterHotKey(hwnd, 2, mods, 'R' as u32).is_ok();
+        a && b
+    }
+}
+
+fn unregister_hotkeys(hwnd: HWND) {
+    unsafe {
+        let _ = UnregisterHotKey(hwnd, 1);
+        let _ = UnregisterHotKey(hwnd, 2);
+    }
+}
+
+/// Menu con las salidas de audio disponibles para una aplicacion del mezclador.
+fn open_device_menu(hwnd: HWND, idx: usize) {
+    let mut target: Option<(mixer::Mixer, String)> = None;
+    with_app(|a| {
+        if let Some(mx) = &a.mixer {
+            let st = mx.state();
+            if idx >= 1 {
+                if let Some(app) = st.apps.get(idx - 1) {
+                    target = Some((mx.clone(), app.name.clone()));
+                }
+            }
+        }
+    });
+    let Some((mx, name)) = target else { return };
+    let Some(list) = mx.devices(&name) else { return };
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let title: Vec<u16> = format!("Salida de {}", name).encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(title.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let fl = if list.current.is_empty() { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, fl, 4000, w!("Predeterminado del sistema"));
+        for (i, d) in list.devices.iter().enumerate() {
+            let wide: Vec<u16> = d.name.encode_utf16().chain(std::iter::once(0)).collect();
+            let on = !list.current.is_empty() && d.id.eq_ignore_ascii_case(&list.current);
+            let fl = if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, fl, 4001 + i, PCWSTR(wide.as_ptr()));
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None);
+        let _ = DestroyMenu(menu);
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let c = cmd.0;
+        if c == 4000 {
+            mx.set_device(&name, "");
+        } else if c > 4000 {
+            if let Some(d) = list.devices.get((c - 4001) as usize) {
+                mx.set_device(&name, &d.id);
+            }
+        }
+    }
+}
+
 fn popup(hwnd: HWND) {
     let cmd = show_menu(hwnd);
     unsafe {
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     }
     if cmd == 130 {
-        unsafe { PostQuitMessage(0) };
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     } else if cmd != 0 {
         with_app(|a| a.menu_cmd(cmd));
     }
@@ -4794,7 +5257,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
-                popup(hwnd);
+                let x = (lp.0 & 0xFFFF) as i16 as i32;
+                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                let mut idx: Option<usize> = None;
+                with_app(|a| idx = a.mixer_hit(x, y));
+                match idx {
+                    Some(i) => open_device_menu(hwnd, i),
+                    None => popup(hwnd),
+                }
                 LRESULT(0)
             }
             WM_TRAY => {
@@ -4810,6 +5280,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_APP_WEATHER => {
                 with_app(|a| a.on_weather());
+                LRESULT(0)
+            }
+            WM_APP_MIXER => {
+                with_app(|a| a.on_mixer());
+                LRESULT(0)
+            }
+            WM_APP_DEVMENU => {
+                open_device_menu(hwnd, wp.0);
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -4887,6 +5365,7 @@ fn main() -> windows::core::Result<()> {
         let home = POINT { x: (sw - pw) / 2, y: 0 };
 
         let (features, cfg) = load_config();
+        *SOURCE_SEL.lock().unwrap() = cfg.source.clone();
         MUSIC_ON.store(features[F_MUSIC], Ordering::Relaxed);
         COVER_ON.store(features[F_COVER], Ordering::Relaxed);
         let th = theme_of(cfg.theme);
@@ -4976,6 +5455,10 @@ fn main() -> windows::core::Result<()> {
             animating: false,
             vis_on: false,
             prox_on: false,
+            dodge: 0.0,
+            dodge_target: 0.0,
+            edge_since: None,
+            away_since: None,
             hidden: false,
             last: Instant::now(),
             t0: Instant::now(),
@@ -5022,6 +5505,9 @@ fn main() -> windows::core::Result<()> {
             sys_cpu_hist: Vec::new(),
             sys_ram_hist: Vec::new(),
             recorder: None,
+            mixer: None,
+            mix_override: 0.0,
+            mix_last: -1.0,
             rec_hidden: false,
             last_shot: String::new(),
             last_video: String::new(),
@@ -5034,27 +5520,20 @@ fn main() -> windows::core::Result<()> {
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         tray_add(hwnd);
 
-        // Ctrl+Alt+S captura, Ctrl+Alt+R graba/detiene.
-        let mods = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_NOREPEAT.0);
-        let hot_s = RegisterHotKey(hwnd, 1, mods, 'S' as u32).is_ok();
-        let hot_r = RegisterHotKey(hwnd, 2, mods, 'R' as u32).is_ok();
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         with_app(|a| {
             a.apply_pos();
             a.ensure_page();
             a.render();
-            if !hot_s || !hot_r {
+            if a.feat(F_CAPTURE) && !register_hotkeys(a.hwnd) {
                 a.show_toast(false, "Atajo ocupado: usa el menú de la bandeja".into(), 6);
                 a.render();
             }
             if a.feat(F_WEATHER) {
                 a.ensure_weather();
             }
-            if a.feat(F_PROX) {
-                SetTimer(a.hwnd, T_PROX, 150, None);
-                a.prox_on = true;
-            }
+            a.sync_poll_timer();
         });
         SetTimer(hwnd, T_CLOCK, 1000, None);
 

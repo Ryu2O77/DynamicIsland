@@ -8,8 +8,8 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
 
 ## Features
 
-- **Music**: title, artist, cover art, progress bar (click to seek), previous / play-pause / next, an animated visualizer, and synchronized lyrics from LRCLIB shown right below the controls. Works with any player that integrates with Windows media controls (Spotify, browsers, etc.). An optional lyric line can also be shown in the collapsed island.
-- **Clock**: time, date, battery, and the current weather (icon, temperature, condition, and city).
+- **Music**: title, artist, cover art, progress bar (click to seek), previous / play-pause / next, an animated visualizer, and synchronized lyrics from LRCLIB shown right below the controls. Works with any player that integrates with Windows media controls (Spotify, browsers, etc.). The lyrics are hidden by default: a lyrics icon next to the controls turns them on or off (and, with *Lyric in the island* enabled, also shows the current line in the collapsed island).
+- **Clock**: a compact row with the time, date and battery on the left and the current weather (icon, temperature, condition and city) on the right.
 - **Calendar**: month view with today highlighted.
 - **Weather**: current conditions and a 3-day forecast via Open-Meteo (no API key). City search, IP-based location detection, and °C/°F units. Refreshes every 15 minutes while visible.
 - **System**: CPU, RAM, disk free space, network throughput, uptime, and 60-sample sparklines.
@@ -21,7 +21,10 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
 - **Tasks**: a simple to-do list stored locally.
 - **Battery alerts**: when the charger is connected/disconnected and when the battery drops below 20%.
 - **Volume**: mouse wheel over the island; middle-click to mute.
+- **Volume mixer**: master volume and per-application volume with mute buttons (Core Audio). Click an app's name (or right-click its name/mute icon) to choose which output device that app plays through.
+- **Media source**: a chip next to the controls cycles between the apps that expose media controls (Spotify, browsers, foobar2000, ...); *Auto* follows the system's current session.
 - **Hide in fullscreen** (games, videos).
+- **Dodge browser tabs** (optional): hold the mouse on the top edge of the screen over the island for one second and it slides down out of the way; it returns when the cursor moves away. It also works in Notch style: the notch detaches and becomes a floating island while it dodges (the very top row of pixels does not expand the notch, so you can park the cursor there).
 - **Screen capture**:
   - `Ctrl+Alt+S` takes a screenshot of the entire virtual desktop (all monitors) and saves it as PNG.
   - `Ctrl+Alt+R` starts/stops a 30 fps H.264/MP4 recording of the primary monitor.
