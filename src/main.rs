@@ -6,6 +6,7 @@
 //! proximidad, fuente elegible. Configuracion en %APPDATA%\DynamicIsland\config.ini.
 
 mod capture;
+mod epub;
 mod mixer;
 mod system;
 mod weather;
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::{w, Interface, HSTRING, PCWSTR};
+use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Data::Json::{JsonArray, JsonObject};
 use windows::Foundation::{TimeSpan, Uri};
 use windows::Graphics::Imaging::{
@@ -34,7 +35,12 @@ use windows::Web::Http::HttpClient;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Registry::*;
@@ -68,6 +74,12 @@ const WM_APP_FRAME: u32 = 0x8000 + 3;
 const WM_APP_WEATHER: u32 = 0x8000 + 4;
 const WM_APP_MIXER: u32 = 0x8000 + 9;
 const WM_APP_DEVMENU: u32 = 0x8000 + 10;
+const WM_APP_BOOK: u32 = 0x8000 + 11;
+
+// Lector de EPUB: lineas por pagina, paso entre lineas y ancho del texto (logicos)
+const BOOK_LINES: usize = 7;
+const BOOK_PITCH: f32 = 20.0;
+const BOOK_W: f32 = 388.0;
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 const MA_NOACTIVATE_: isize = 3;
 const MA_ACTIVATE_: isize = 1;
@@ -114,21 +126,23 @@ struct Theme {
     ring: f32,
     frame: bool,
     font: &'static str,
+    tabs_center: bool, // barra de pestañas centrada, solo iconos (estilo Apple)
 }
 
-const THEME_NAMES: [&str; 3] = ["Clásico", "NieR claro", "NieR oscuro"];
+const THEME_NAMES: [&str; 3] = ["Predeterminado", "NieR claro", "NieR oscuro"];
 const THEMES: [Theme; 3] = [
+    // Predeterminado (estilo Apple): negro puro, grises iOS, acento naranja, pestañas centradas
     Theme {
         bg: c(0, 0, 0),
         fg: WHITE,
-        fg2: c(165, 165, 172),
+        fg2: c(152, 152, 157),
         accent: ORANGE,
         on_accent: WHITE,
         good: GREEN,
-        surface: c(62, 62, 70),
-        surface_hi: c(86, 86, 94),
-        track: c(70, 70, 78),
-        key_fn: c(160, 160, 168),
+        surface: c(44, 44, 46),
+        surface_hi: c(58, 58, 60),
+        track: c(58, 58, 60),
+        key_fn: c(165, 165, 170),
         key_fn_fg: c(0, 0, 0),
         knob: WHITE,
         big_bg: WHITE,
@@ -136,7 +150,8 @@ const THEMES: [Theme; 3] = [
         sharp: false,
         ring: 0.14,
         frame: false,
-        font: "Segoe UI",
+        font: "Segoe UI Variable",
+        tabs_center: true,
     },
     Theme {
         bg: c(218, 212, 187),
@@ -157,6 +172,7 @@ const THEMES: [Theme; 3] = [
         ring: 0.0,
         frame: true,
         font: "Bahnschrift",
+        tabs_center: true,
     },
     Theme {
         bg: c(66, 62, 54),
@@ -177,8 +193,26 @@ const THEMES: [Theme; 3] = [
         ring: 0.0,
         frame: true,
         font: "Bahnschrift",
+        tabs_center: true,
     },
 ];
+
+/// Colores de acento elegibles (0 = el del tema).
+const ACCENT_NAMES: [&str; 7] = ["Del tema", "Naranja", "Azul", "Verde", "Rosa", "Morado", "Blanco"];
+const ACCENT_COLORS: [Rgb; 6] = [ORANGE, c(10, 132, 255), GREEN, c(255, 55, 95), c(191, 90, 242), WHITE];
+
+/// Tema con el acento elegido aplicado.
+fn make_theme(cfg: &Cfg) -> Theme {
+    let mut t = theme_of(cfg.theme);
+    let a = cfg.accent as usize;
+    if a >= 1 && a <= ACCENT_COLORS.len() {
+        t.accent = ACCENT_COLORS[a - 1];
+        if a == ACCENT_COLORS.len() {
+            t.on_accent = c(0, 0, 0); // acento blanco: texto negro encima
+        }
+    }
+    t
+}
 
 fn theme_of(i: u8) -> Theme {
     THEMES[(i as usize).min(THEMES.len() - 1)]
@@ -225,7 +259,9 @@ const F_CAPTURE: usize = 20;
 const F_REC_HIDE: usize = 21;
 const F_DODGE: usize = 22;
 const F_MIXER: usize = 23;
-const F_COUNT: usize = 24;
+const F_BOOK: usize = 24;
+const F_DISCORD: usize = 25;
+const F_COUNT: usize = 26;
 
 // Pomodoro: enfoque 25 min, descanso corto 5 min y descanso largo 15 min cada 4 rondas.
 const POMO_WORK: u64 = 25 * 60;
@@ -258,12 +294,14 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("rechide", "Ocultar al grabar"),
     ("dodge", "Esquivar pestañas del navegador"),
     ("mixer", "Mezclador de volumen"),
+    ("book", "Lector de EPUB"),
+    ("discord", "Discord"),
 ];
 
 // que funciones salen en la pestaña "Funciones" de Ajustes
-const FUNC_LIST: [usize; 15] = [
+const FUNC_LIST: [usize; 17] = [
     F_MUSIC, F_LYRICS, F_LYRMODE, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF,
-    F_BATT, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER,
+    F_BATT, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER, F_BOOK, F_DISCORD,
 ];
 
 fn pomo_dur(phase: u8) -> u64 {
@@ -298,6 +336,7 @@ struct Cfg {
     wx_unit: u8, // 0 °C, 1 °F
     lyrics_open: bool,
     source: String,
+    accent: u8, // 0 = el del tema
 }
 
 impl Default for Cfg {
@@ -316,6 +355,7 @@ impl Default for Cfg {
             wx_unit: 0,
             lyrics_open: false,
             source: String::new(),
+            accent: 0,
         }
     }
 }
@@ -409,6 +449,8 @@ enum Page {
     Mixer,
     Calc,
     Todo,
+    Book,
+    Discord,
     System,
     Capture,
     Settings,
@@ -429,6 +471,11 @@ enum Act {
     Pin,
     Notif,
     Lyrics,
+    Like,
+    DcMute,
+    DcDeaf,
+    DcFocus,
+    DcLeave,
     Prev,
     Toggle,
     Next,
@@ -469,6 +516,11 @@ enum Act {
     MixDevice(usize),
     Source,
     ResetPos,
+    BookOpen,
+    BookPrev,
+    BookNext,
+    BookChPrev,
+    BookChNext,
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +536,8 @@ enum WKind {
     Bar,
     Chip,
     Lyric,
+    Heart,
+    Dc(u8),
     Mute,
     Source,
     Selector,
@@ -647,6 +701,19 @@ struct App {
     slider_drag: Option<u8>,
     drag: Option<DragState>,
     prev_fg: isize,
+    book: Option<epub::Book>,
+    book_state: u8, // 0 sin libro, 1 cargando, 2 listo, 3 error
+    book_err: String,
+    book_path: String,                  // ultimo libro abierto (book.ini)
+    book_pos: (usize, usize, usize),    // capitulo, parrafo, byte: inicio de la pagina actual
+    book_pages: Vec<Vec<epub::Line>>,   // paginas del capitulo actual
+    book_page: usize,
+    dc_mute: bool,
+    dc_deaf: bool,
+    book_pk: (usize, u8, u8, u32),      // (capitulo, fuente, tema, escala) de la paginacion
+    tab_x: f32,                         // x de la pastilla de la pestaña activa (animada); <0 = sin posicion
+    last_media: Media,                  // ultimo estado de reproduccion (para animar el cambio de cancion)
+    prev_media: Option<Media>,          // la cancion anterior mientras se desvanece
 }
 
 thread_local! {
@@ -687,7 +754,10 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
                         }
                     }
                     match k {
-                        "theme" => cfg.theme = v.parse::<u8>().unwrap_or(0).min(THEMES.len() as u8 - 1),
+                        "theme" => {
+                            let t = v.parse::<u8>().unwrap_or(0);
+                            cfg.theme = if t as usize >= THEMES.len() { 0 } else { t };
+                        }
                         "style" => cfg.style = v.parse::<u8>().unwrap_or(0).min(1),
                         "font" => cfg.font = v.parse::<u8>().unwrap_or(0).min(FONTS.len() as u8 - 1),
                         "opacity_min" => cfg.op_min = v.parse::<f32>().unwrap_or(0.35).clamp(0.1, 0.9),
@@ -700,6 +770,7 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
                         "wx_unit" => cfg.wx_unit = v.parse::<u8>().unwrap_or(0).min(1),
                         "lyrics_open" => cfg.lyrics_open = v != "0",
                         "source" => cfg.source = v.to_string(),
+                        "accent" => cfg.accent = v.parse::<u8>().unwrap_or(0).min(ACCENT_NAMES.len() as u8 - 1),
                         _ => {}
                     }
                 }
@@ -729,6 +800,7 @@ fn save_config(f: &[bool; F_COUNT], cfg: &Cfg) {
             if cfg.lyrics_open { 1 } else { 0 }
         ));
         s.push_str(&format!("source={}\n", cfg.source.replace(['\n', '\r'], " ").trim()));
+        s.push_str(&format!("accent={}\n", cfg.accent));
         let _ = std::fs::write(d.join("config.ini"), s);
     }
 }
@@ -747,6 +819,102 @@ fn load_todos() -> Vec<(bool, String)> {
         }
     }
     v
+}
+
+// ------------------------------------------------------------ lector de EPUB (estado y utilidades)
+
+/// Ultimo libro y posicion: `%APPDATA%\DynamicIsland\book.ini`.
+fn load_book_state() -> (String, (usize, usize, usize)) {
+    let mut path = String::new();
+    let mut pos = (0usize, 0usize, 0usize);
+    if let Some(d) = data_dir() {
+        if let Ok(txt) = std::fs::read_to_string(d.join("book.ini")) {
+            for line in txt.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim();
+                    match k.trim() {
+                        "path" => path = v.to_string(),
+                        "chapter" => pos.0 = v.parse().unwrap_or(0),
+                        "para" => pos.1 = v.parse().unwrap_or(0),
+                        "off" => pos.2 = v.parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (path, pos)
+}
+
+fn save_book_state(path: &str, pos: (usize, usize, usize)) {
+    if let Some(d) = data_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let s = format!("path={}\nchapter={}\npara={}\noff={}\n", path.replace(['\n', '\r'], " "), pos.0, pos.1, pos.2);
+        let _ = std::fs::write(d.join("book.ini"), s);
+    }
+}
+
+/// Ancho en pixeles de `s` con la fuente `font` (para partir lineas).
+unsafe fn text_width(dc: HDC, font: HFONT, s: &str) -> i32 {
+    let v: Vec<u16> = s.encode_utf16().collect();
+    let old = SelectObject(dc, HGDIOBJ(font.0));
+    let mut sz = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &v, &mut sz);
+    SelectObject(dc, old);
+    sz.cx
+}
+
+/// Resultado de la carga del libro (lo deja un hilo y lo recoge la ventana).
+static BOOK_Q: Mutex<Option<Result<epub::Book, String>>> = Mutex::new(None);
+static BOOK_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Cuadro "Abrir archivo" para elegir un .epub.
+fn pick_epub() -> Option<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let mut file = [0u16; 1024];
+        let filter: Vec<u16> = "Libros EPUB (*.epub)\0*.epub\0Todos los archivos\0*.*\0\0".encode_utf16().collect();
+        let title: Vec<u16> = "Abrir EPUB\0".encode_utf16().collect();
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: PWSTR(file.as_mut_ptr()),
+            nMaxFile: file.len() as u32,
+            lpstrTitle: PCWSTR(title.as_ptr()),
+            Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
+            ..Default::default()
+        };
+        let ok = GetOpenFileNameW(&mut ofn).as_bool();
+        CoUninitialize();
+        if !ok {
+            return None;
+        }
+        let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+        Some(String::from_utf16_lossy(&file[..n]))
+    }
+}
+
+/// Abre (con o sin cuadro de seleccion) y analiza un EPUB en un hilo aparte.
+fn start_book_load(hwnd: isize, path: Option<String>) {
+    if BOOK_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let chosen = match path {
+            Some(p) => Some(p),
+            None => pick_epub(),
+        };
+        match chosen {
+            Some(p) => {
+                *BOOK_Q.lock().unwrap() = Some(epub::Book::load(&p));
+                BOOK_BUSY.store(false, Ordering::Release);
+                unsafe {
+                    let _ = PostMessageW(HWND(hwnd as _), WM_APP_BOOK, WPARAM(0), LPARAM(0));
+                }
+            }
+            None => BOOK_BUSY.store(false, Ordering::Release),
+        }
+    });
 }
 
 fn save_todos(t: &[(bool, String)]) {
@@ -1352,6 +1520,96 @@ fn set_autostart(on: bool) {
     }
 }
 
+/// Busca la ventana principal visible de un programa por el nombre de su .exe (en minusculas).
+fn find_exe_window(exe: &str) -> isize {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    struct Q {
+        suffix: String,
+        found: isize,
+    }
+    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
+        unsafe {
+            if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || GetWindowTextLengthW(h) == 0 {
+                return BOOL(1);
+            }
+            let q = &mut *(lp.0 as *mut Q);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            if let Ok(ph) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut buf = [0u16; 512];
+                let mut n = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(ph, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+                let _ = CloseHandle(ph);
+                if ok {
+                    let path = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+                    if path.ends_with(&q.suffix) {
+                        q.found = h.0 as isize;
+                        return BOOL(0);
+                    }
+                }
+            }
+            BOOL(1)
+        }
+    }
+    let mut q = Q { suffix: format!("\\{}", exe), found: 0 };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut q as *mut Q as isize));
+    }
+    q.found
+}
+
+/// Trae al frente la ventana de un programa un instante, envia un atajo y devuelve el foco.
+fn app_shortcut(exe: &'static str, keys: &'static [u8]) {
+    std::thread::spawn(move || unsafe {
+        let found = find_exe_window(exe);
+        if found == 0 {
+            return;
+        }
+        let prev = GetForegroundWindow();
+        let _ = SetForegroundWindow(HWND(found as _));
+        std::thread::sleep(Duration::from_millis(120));
+        for &vk in keys {
+            keybd_event(vk, 0, KEYBD_EVENT_FLAGS(0), 0);
+        }
+        for &vk in keys.iter().rev() {
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        }
+        std::thread::sleep(Duration::from_millis(120));
+        if prev.0 as isize != 0 {
+            let _ = SetForegroundWindow(prev);
+        }
+    });
+}
+
+/// Spotify: Alt+Shift+B (guardar en Tus me gusta); solo funciona con la ventana enfocada.
+fn spotify_like() {
+    app_shortcut("spotify.exe", &[0x12, 0x10, 0x42]);
+}
+
+/// Discord: atajos globales por defecto (Ctrl+Shift+M mutear, Ctrl+Shift+D ensordecer);
+/// funcionan con Discord en segundo plano, sin cambiar de ventana.
+fn discord_keys(letter: u8) {
+    std::thread::spawn(move || unsafe {
+        for vk in [0x11u8, 0x10, letter] {
+            keybd_event(vk, 0, KEYBD_EVENT_FLAGS(0), 0);
+        }
+        for vk in [letter, 0x10u8, 0x11] {
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        }
+    });
+}
+
+fn discord_focus() {
+    let h = find_exe_window("discord.exe");
+    if h != 0 {
+        unsafe {
+            let _ = SetForegroundWindow(HWND(h as _));
+        }
+    }
+}
+
 fn key_tap(vk: u8, times: i32) {
     unsafe {
         for _ in 0..times {
@@ -1740,6 +1998,18 @@ impl<'a> Canvas<'a> {
         self.poly(&[(x1 + nx, y1 + ny), (x2 + nx, y2 + ny), (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)], col, f);
     }
 
+    fn arc(&mut self, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, t: f32, col: Rgb, f: f32) {
+        let n = 12;
+        let mut p = (cx + r * a0.cos(), cy + r * a0.sin());
+        for k in 1..=n {
+            let a = a0 + (a1 - a0) * k as f32 / n as f32;
+            let q = (cx + r * a.cos(), cy + r * a.sin());
+            self.line(p.0, p.1, q.0, q.1, t, col, f);
+            self.circle(q.0, q.1, t / 2.0, col, f);
+            p = q;
+        }
+    }
+
     fn arrow(&mut self, dir: i8, cx: f32, cy: f32, s: f32, col: Rgb, f: f32) {
         if dir < 0 {
             self.poly(&[(cx + 3.0 * s, cy - 5.0 * s), (cx + 3.0 * s, cy + 5.0 * s), (cx - 3.5 * s, cy)], col, f);
@@ -1900,6 +2170,14 @@ impl<'a> Canvas<'a> {
                     self.circle(cx + dx * s, cy + dy * s, 1.1 * s, bg, f);
                 }
             }
+            Page::Book => {
+                self.rrect(cx - 7.0 * s, cy - 6.0 * s, 6.4 * s, 12.0 * s, 1.6 * s, col, f);
+                self.rrect(cx + 0.6 * s, cy - 6.0 * s, 6.4 * s, 12.0 * s, 1.6 * s, col, f);
+                for (x1, x2) in [(-5.4f32, -2.4f32), (2.4, 5.4)] {
+                    self.line(cx + x1 * s, cy - 2.0 * s, cx + x2 * s, cy - 2.0 * s, 1.0 * s, bg, f);
+                    self.line(cx + x1 * s, cy + 1.0 * s, cx + x2 * s, cy + 1.0 * s, 1.0 * s, bg, f);
+                }
+            }
             Page::Todo => {
                 self.rrect(cx - 6.5 * s, cy - 6.5 * s, 13.0 * s, 13.0 * s, 3.0 * s, col, f);
                 self.rrect(cx - 5.0 * s, cy - 5.0 * s, 10.0 * s, 10.0 * s, 2.0 * s, bg, f);
@@ -1931,6 +2209,12 @@ impl<'a> Canvas<'a> {
                 }
             }
             Page::Mixer => self.speaker(cx, cy, s, col, false, f),
+            Page::Discord => {
+                self.rrect(cx - 7.5 * s, cy - 5.5 * s, 15.0 * s, 10.5 * s, 4.5 * s, col, f);
+                self.rrect(cx - 4.0 * s, cy + 3.0 * s, 4.0 * s, 4.0 * s, 1.5 * s, col, f);
+                self.circle(cx - 2.8 * s, cy - 0.5 * s, 1.5 * s, bg, f);
+                self.circle(cx + 2.8 * s, cy - 0.5 * s, 1.5 * s, bg, f);
+            }
             Page::Capture => {
                 self.rrect(cx - 7.0 * s, cy - 4.0 * s, 14.0 * s, 10.0 * s, 2.2 * s, col, f);
                 self.rrect(cx - 2.8 * s, cy - 6.5 * s, 5.6 * s, 3.0 * s, 1.0 * s, col, f);
@@ -1967,8 +2251,10 @@ impl App {
         self.features[i]
     }
 
+    /// Estilo notch y pegado al borde superior; si se arrastra hacia abajo se despega
+    /// y se ve como isla flotante (al soltarlo cerca del borde vuelve a pegarse).
     fn notch(&self) -> bool {
-        self.cfg.style == 1
+        self.cfg.style == 1 && self.pos.y <= self.home.y + 2
     }
 
     fn top(&self) -> f32 {
@@ -1996,6 +2282,8 @@ impl App {
             Page::Time => self.feat(F_TIMER) || self.feat(F_STOPWATCH),
             Page::Calc => self.feat(F_CALC),
             Page::Todo => self.feat(F_TODO),
+            Page::Book => self.feat(F_BOOK),
+            Page::Discord => self.feat(F_DISCORD),
             Page::System => self.feat(F_SYSTEM),
             Page::Capture => self.feat(F_CAPTURE),
             Page::Mixer => self.feat(F_MIXER),
@@ -2120,6 +2408,11 @@ impl App {
     }
 
     /// 0 temporizador, 1 cronometro, 2 musica, 3 reloj, 4 vacio, 5 letra, 6 clima, 7 grabando, 8 pomodoro
+    /// La cancion se muestra en la isla cerrada (el chip de fuente la puede dejar en "off").
+    fn song_in_collapsed(&self) -> bool {
+        self.cfg.source != "off"
+    }
+
     fn collapsed_view(&self, m: &Media) -> u8 {
         if self.recorder.is_some() {
             7
@@ -2129,9 +2422,9 @@ impl App {
             0
         } else if self.sw_start.is_some() {
             1
-        } else if self.lyric_ready(m) {
+        } else if self.song_in_collapsed() && self.lyric_ready(m) {
             5
-        } else if m.has {
+        } else if self.song_in_collapsed() && m.has {
             2
         } else if self.feat(F_WEATHER) && self.wx.lock().unwrap().state == 2 {
             6
@@ -2159,7 +2452,7 @@ impl App {
                 } else if sw || lyr_mode {
                     true
                 } else {
-                    vis
+                    vis && self.collapsed_view(&mc) == 2
                 }
             }
             Mode::Expanded => match self.page {
@@ -2201,6 +2494,8 @@ impl App {
                 Page::Time => (EW_WIDE, 230.0),
                 Page::Calc => (EW, 304.0),
                 Page::Todo => (EW, 230.0),
+                Page::Book => (EW, 246.0),
+                Page::Discord => (EW, 152.0),
                 Page::Weather => (EW, 250.0),
                 Page::System => (EW, 240.0),
                 Page::Capture => (EW, 210.0),
@@ -2209,8 +2504,8 @@ impl App {
                     (EW, 88.0 + n * 30.0)
                 }
                 Page::Settings => match self.settings_tab {
-                    0 => (EW, 338.0),
-                    1 => (EW, 278.0),
+                    0 => (EW, 368.0),
+                    1 => (EW, 308.0),
                     2 => (EW, 362.0),
                     _ => (EW, 188.0),
                 },
@@ -2276,6 +2571,17 @@ impl App {
         {
             self.check_lyrics();
         }
+        // libro: se abre el ultimo EPUB solo cuando se muestra su pestaña
+        if new == Mode::Expanded
+            && self.page == Page::Book
+            && self.feat(F_BOOK)
+            && self.book_state == 0
+            && !self.book_path.is_empty()
+            && !BOOK_BUSY.load(Ordering::Acquire)
+        {
+            self.book_state = 1;
+            start_book_load(self.hwnd.0 as isize, Some(self.book_path.clone()));
+        }
         // mezclador: solo consulta mientras su pestaña esta visible
         if new == Mode::Expanded && self.page == Page::Mixer && self.feat(F_MIXER) {
             if self.mixer.is_none() {
@@ -2317,7 +2623,24 @@ impl App {
         }
     }
 
+    /// Al cambiar de cancion con la isla cerrada, la anterior se desvanece mientras entra la nueva
+    /// (titulo, caratula y letra), en vez de cambiar de golpe.
+    fn song_transition(&mut self) {
+        let cur = self.media.lock().unwrap().clone();
+        let changed = cur.has
+            && self.last_media.has
+            && (cur.title != self.last_media.title || cur.artist != self.last_media.artist);
+        if changed && self.mode == Mode::Collapsed && !self.hidden {
+            self.prev_media = Some(self.last_media.clone());
+            self.prev_view = Some((Mode::Collapsed, Page::Clock));
+            self.fade = 0.0;
+            self.start_anim();
+        }
+        self.last_media = cur;
+    }
+
     fn on_media(&mut self) {
+        self.song_transition();
         self.update_vis_timer();
         self.refresh_mode();
         if !self.hidden {
@@ -2405,6 +2728,28 @@ impl App {
             settled = false;
         } else {
             self.dodge = self.dodge_target;
+        }
+        // pastilla de la pestaña activa: se desliza hasta la nueva (estilo iOS)
+        if self.mode == Mode::Expanded && self.th.tabs_center {
+            let target_x = self
+                .layout(self.mode, self.page, &m)
+                .iter()
+                .find(|w| matches!(w.kind, WKind::Tab(_)) && w.on)
+                .map(|w| w.x);
+            if let Some(tx) = target_x {
+                if self.tab_x < 0.0 {
+                    self.tab_x = tx;
+                }
+                let kt = 1.0 - (-dt * 18.0).exp();
+                self.tab_x += (tx - self.tab_x) * kt;
+                if (tx - self.tab_x).abs() > 0.3 {
+                    settled = false;
+                } else {
+                    self.tab_x = tx;
+                }
+            }
+        } else {
+            self.tab_x = -1.0;
         }
         self.fade = (self.fade + dt / 0.25).min(1.0);
         if self.fade < 1.0 {
@@ -2773,11 +3118,7 @@ impl App {
     }
 
     fn apply_pos(&mut self) {
-        let p = if self.notch() {
-            self.home
-        } else {
-            self.clamp_pos(POINT { x: self.home.x + self.cfg.dx, y: self.home.y + self.cfg.dy })
-        };
+        let p = self.clamp_pos(POINT { x: self.home.x + self.cfg.dx, y: self.home.y + self.cfg.dy });
         self.pos = p;
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND::default(), p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2923,7 +3264,7 @@ impl App {
             }
             return;
         }
-        if self.feat(F_DRAG) && !self.notch() {
+        if self.feat(F_DRAG) {
             let (x0, y0, w, h) = self.pill_rect();
             let (fx, fy) = (x as f32, y as f32);
             if fx >= x0 && fx <= x0 + w && fy >= y0 && fy <= y0 + h {
@@ -2933,7 +3274,11 @@ impl App {
                     SetCapture(self.hwnd);
                 }
                 // si estaba esquivando, arrancar desde la posicion visible
+                let docked = self.notch();
                 self.pos = self.win_pos();
+                if docked {
+                    self.pos.y = self.home.y; // el notch pegado arranca desde el borde, aunque estuviera esquivando
+                }
                 self.dodge = 0.0;
                 self.dodge_target = 0.0;
                 self.drag = Some(DragState { c0: p, p0: self.pos, moved: false });
@@ -3016,6 +3361,15 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: i32) {
+        if self.mode == Mode::Expanded && self.page == Page::Book && self.book.is_some() {
+            if delta != 0 {
+                self.book_turn(if delta > 0 { -1 } else { 1 });
+                if !self.animating {
+                    self.render();
+                }
+            }
+            return;
+        }
         if self.mode == Mode::Expanded && self.page == Page::Todo {
             let max = self.todos.len().saturating_sub(5);
             if delta > 0 {
@@ -3046,6 +3400,114 @@ impl App {
         self.font_small = make_font(face, (13.0 * s) as i32, 400, false);
         self.font_big = make_font(face, (30.0 * s) as i32, 300, false);
         self.font_strike = make_font(face, (13.0 * s) as i32, 400, true);
+    }
+
+    // ---- lector de EPUB
+
+    /// Reparte el capitulo actual en paginas (solo si cambio algo) y situa la pagina actual.
+    fn book_ensure_pages(&mut self) {
+        let nch = match &self.book {
+            Some(b) => b.chapters.len(),
+            None => return,
+        };
+        let ch = self.book_pos.0.min(nch - 1);
+        self.book_pos.0 = ch;
+        let key = (ch, self.cfg.font, self.cfg.theme, self.s.to_bits());
+        if key == self.book_pk && !self.book_pages.is_empty() {
+            return;
+        }
+        let (mem, fm, fs) = (self.mem, self.font_main, self.font_small);
+        let width = (BOOK_W * self.s) as i32;
+        let pages = {
+            let Some(book) = &self.book else { return };
+            let mut measure = |t: &str, heading: bool| -> i32 { unsafe { text_width(mem, if heading { fm } else { fs }, t) } };
+            epub::paginate(&book.chapters[ch].paras, width, BOOK_LINES, &mut measure)
+        };
+        self.book_page = epub::page_for(&pages, (self.book_pos.1, self.book_pos.2));
+        self.book_pages = pages;
+        self.book_pk = key;
+        self.book_sync_pos();
+    }
+
+    /// Guarda el inicio de la pagina actual como posicion de lectura.
+    fn book_sync_pos(&mut self) {
+        if let Some(l) = self.book_pages.get(self.book_page).and_then(|p| p.first()) {
+            self.book_pos = (self.book_pos.0, l.para, l.off);
+        }
+        if let Some(b) = &self.book {
+            save_book_state(&b.path, self.book_pos);
+        }
+    }
+
+    fn book_turn(&mut self, dir: i32) {
+        let nch = match &self.book {
+            Some(b) => b.chapters.len(),
+            None => return,
+        };
+        self.book_ensure_pages();
+        let ch = self.book_pos.0;
+        if dir > 0 {
+            if self.book_page + 1 < self.book_pages.len() {
+                self.book_page += 1;
+                self.book_sync_pos();
+            } else if ch + 1 < nch {
+                self.book_pos = (ch + 1, 0, 0);
+                self.book_ensure_pages();
+            }
+        } else if self.book_page > 0 {
+            self.book_page -= 1;
+            self.book_sync_pos();
+        } else if ch > 0 {
+            // ultima pagina del capitulo anterior
+            self.book_pos = (ch - 1, usize::MAX, 0);
+            self.book_ensure_pages();
+        }
+    }
+
+    fn book_chapter(&mut self, dir: i32) {
+        let nch = match &self.book {
+            Some(b) => b.chapters.len(),
+            None => return,
+        };
+        self.book_ensure_pages();
+        let ch = self.book_pos.0;
+        let target = if dir > 0 {
+            (ch + 1).min(nch - 1)
+        } else if self.book_page > 0 {
+            ch // primero vuelve al inicio del capitulo
+        } else {
+            ch.saturating_sub(1)
+        };
+        self.book_pos = (target, 0, 0);
+        self.book_ensure_pages();
+    }
+
+    /// Llega el resultado de la carga de un EPUB.
+    fn on_book(&mut self) {
+        let Some(res) = BOOK_Q.lock().unwrap().take() else { return };
+        match res {
+            Ok(b) => {
+                // misma obra que la guardada: se reanuda donde se dejo
+                let same = b.path == self.book_path;
+                self.book_pos = if same { self.book_pos } else { (0, 0, 0) };
+                self.book_path = b.path.clone();
+                self.book = Some(b);
+                self.book_state = 2;
+                self.book_err.clear();
+                self.book_pages.clear();
+                self.book_pk = (usize::MAX, 0, 0, 0);
+                self.book_ensure_pages();
+            }
+            Err(e) => {
+                self.book_err = e;
+                if self.book.is_some() {
+                    self.show_toast(false, "No se pudo abrir el EPUB".to_string(), 4);
+                } else {
+                    self.book_state = 3;
+                }
+            }
+        }
+        self.changed();
     }
 
     fn add_todo(&mut self) {
@@ -3334,6 +3796,21 @@ impl App {
                 self.prox_tick();
             }
             Act::Notif => open_notif(),
+            Act::Like => spotify_like(),
+            Act::DcMute => {
+                self.dc_mute = !self.dc_mute;
+                discord_keys(0x4D);
+            }
+            Act::DcDeaf => {
+                self.dc_deaf = !self.dc_deaf;
+                discord_keys(0x44);
+            }
+            Act::DcFocus => discord_focus(),
+            Act::DcLeave => {
+                self.dc_mute = false;
+                self.dc_deaf = false;
+                discord_keys(0x58);
+            }
             Act::Lyrics => {
                 self.cfg.lyrics_open = !self.cfg.lyrics_open;
                 save_config(&self.features, &self.cfg);
@@ -3451,7 +3928,7 @@ impl App {
                     0 => {
                         let n = THEMES.len() as i32;
                         self.cfg.theme = ((self.cfg.theme as i32 + d).rem_euclid(n)) as u8;
-                        self.th = theme_of(self.cfg.theme);
+                        self.th = make_theme(&self.cfg);
                         self.rebuild_fonts();
                     }
                     1 => {
@@ -3462,6 +3939,11 @@ impl App {
                         let n = FONTS.len() as i32;
                         self.cfg.font = ((self.cfg.font as i32 + d).rem_euclid(n)) as u8;
                         self.rebuild_fonts();
+                    }
+                    4 => {
+                        let n = ACCENT_NAMES.len() as i32;
+                        self.cfg.accent = ((self.cfg.accent as i32 + d).rem_euclid(n)) as u8;
+                        self.th = make_theme(&self.cfg);
                     }
                     _ => {
                         self.cfg.wx_unit = ((self.cfg.wx_unit as i32 + d).rem_euclid(2)) as u8;
@@ -3555,11 +4037,14 @@ impl App {
                 let list = SOURCES.lock().unwrap().clone();
                 let cur = SOURCE_SEL.lock().unwrap().clone();
                 let first = list.first().map(|x| x.id.clone()).unwrap_or_default();
-                let next = if cur.is_empty() {
-                    first
+                // ciclo: Auto -> cada app -> Off (sin cancion en la isla cerrada) -> Auto
+                let next = if cur == "off" {
+                    String::new()
+                } else if cur.is_empty() {
+                    if list.is_empty() { "off".to_string() } else { first }
                 } else {
                     match list.iter().position(|x| x.id.eq_ignore_ascii_case(&cur)) {
-                        Some(i) => list.get(i + 1).map(|x| x.id.clone()).unwrap_or_default(),
+                        Some(i) => list.get(i + 1).map(|x| x.id.clone()).unwrap_or_else(|| "off".to_string()),
                         None => first,
                     }
                 };
@@ -3576,6 +4061,15 @@ impl App {
                 self.apply_pos();
                 save_config(&self.features, &self.cfg);
             }
+            Act::BookOpen => {
+                // el cuadro de seleccion se abre en otro hilo; el resultado llega por WM_APP_BOOK
+                start_book_load(self.hwnd.0 as isize, None);
+                return;
+            }
+            Act::BookPrev => self.book_turn(-1),
+            Act::BookNext => self.book_turn(1),
+            Act::BookChPrev => self.book_chapter(-1),
+            Act::BookChNext => self.book_chapter(1),
         }
         self.changed();
     }
@@ -3864,7 +4358,7 @@ impl App {
         let half = self.cur[0] / 2.0;
 
         // barra de pestañas (iconos; la activa muestra su nombre)
-        const TABS: [(Page, &str, f32); 11] = [
+        const TABS: [(Page, &str, f32); 13] = [
             (Page::Music, "Música", 46.0),
             (Page::Clock, "Reloj", 36.0),
             (Page::Calendar, "Cal.", 30.0),
@@ -3873,25 +4367,43 @@ impl App {
             (Page::Mixer, "Volumen", 48.0),
             (Page::Calc, "Calc", 32.0),
             (Page::Todo, "Tareas", 44.0),
+            (Page::Book, "Libro", 36.0),
+            (Page::Discord, "Discord", 50.0),
             (Page::System, "Sistema", 46.0),
             (Page::Capture, "Captura", 50.0),
             (Page::Settings, "Ajustes", 48.0),
         ];
         const TAB_W: f32 = 23.0;
         const TAB_GAP: f32 = 1.5;
-        let mut x = cx - (half - 16.0) * s;
+        let centered = self.th.tabs_center;
+        // estilo centrado: todas las pestañas iguales (solo iconos), el grupo queda en el centro
+        const CT_W: f32 = 26.0;
+        const CT_GAP: f32 = 1.0;
+        let n_tabs = TABS.iter().filter(|t| self.page_enabled(t.0)).count() as f32;
+        let mut x = if centered {
+            cx - (n_tabs * (CT_W + CT_GAP) - CT_GAP) * s / 2.0
+        } else {
+            cx - (half - 16.0) * s
+        };
         for (p, l, lw) in TABS.iter() {
             if !self.page_enabled(*p) {
                 continue;
             }
             let sel = *p == page;
+            if centered {
+                v.push(Widget::new(x, y0 + 8.0 * s, CT_W * s, 24.0 * s, WKind::Tab(*p), Act::Tab(*p), *l).on(sel));
+                x += (CT_W + CT_GAP) * s;
+                continue;
+            }
             let wd = if sel { TAB_W + lw + 7.0 } else { TAB_W };
             v.push(Widget::new(x, y0 + 8.0 * s, wd * s, 24.0 * s, WKind::Tab(*p), Act::Tab(*p), *l).on(sel));
             x += (wd + TAB_GAP) * s;
         }
         v.push(Widget::new(cx + (half - 40.0) * s, y0 + 8.0 * s, 24.0 * s, 24.0 * s, WKind::Pin, Act::Pin, "").on(self.pinned));
         if self.feat(F_NOTIF) {
-            v.push(Widget::new(cx + (half - 68.0) * s, y0 + 8.0 * s, 24.0 * s, 24.0 * s, WKind::Bell, Act::Notif, ""));
+            // centrado: campana a la izquierda, simetrica al pin
+            let bx = if centered { cx - (half - 16.0) * s } else { cx + (half - 68.0) * s };
+            v.push(Widget::new(bx, y0 + 8.0 * s, 24.0 * s, 24.0 * s, WKind::Bell, Act::Notif, ""));
         }
 
         match page {
@@ -3904,6 +4416,7 @@ impl App {
                     v.push(Widget::new(cx + 40.0 * s, yc - 22.0 * s, 44.0 * s, 44.0 * s, WKind::Icon(Icon::Next), Act::Next, ""));
                     v.push(Widget::new(cx - 156.0 * s, y0 + 98.0 * s, 312.0 * s, 20.0 * s, WKind::Bar, Act::Seek(0.0), ""));
                     v.push(Widget::new(cx - 206.0 * s, yc - 11.0 * s, 118.0 * s, 22.0 * s, WKind::Source, Act::Source, ""));
+                    v.push(Widget::new(cx + 128.0 * s, y0 + 121.0 * s, 26.0 * s, 26.0 * s, WKind::Heart, Act::Like, ""));
                     if self.feat(F_LYRICS) || self.feat(F_LYRMODE) {
                         v.push(
                             Widget::new(cx + 96.0 * s, y0 + 121.0 * s, 26.0 * s, 26.0 * s, WKind::Lyric, Act::Lyrics, "")
@@ -4001,6 +4514,36 @@ impl App {
                     v.push(Widget::new(cx + 168.0 * s, y, 28.0 * s, 26.0 * s, WKind::Del, Act::TodoDel(i), ""));
                 }
             }
+            Page::Discord => {
+                let (m_lbl, d_lbl) = (
+                    if self.dc_mute { "Silenciado" } else { "Mutear" },
+                    if self.dc_deaf { "Ensordecido" } else { "Ensordecer" },
+                );
+                let cw = 92.0 * s;
+                let x0 = cx - 196.0 * s;
+                let (cy0, ch) = (y0 + 40.0 * s, 66.0 * s);
+                v.push(Widget::new(x0, cy0, cw, ch, WKind::Dc(0), Act::DcMute, m_lbl).on(self.dc_mute));
+                v.push(Widget::new(x0 + (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(1), Act::DcDeaf, d_lbl).on(self.dc_deaf));
+                v.push(Widget::new(x0 + 2.0 * (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(2), Act::DcLeave, "Desconectar"));
+                v.push(Widget::new(x0 + 3.0 * (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(3), Act::DcFocus, "Abrir"));
+            }
+            Page::Book => {
+                v.push(Widget::new(cx - 196.0 * s, y0 + 37.0 * s, 64.0 * s, 22.0 * s, WKind::Pill, Act::BookOpen, "Abrir…"));
+                let ty = y0 + 62.0 * s;
+                let th_ = BOOK_PITCH * BOOK_LINES as f32 * s;
+                if self.book.is_some() {
+                    // zonas de toque: izquierda = pagina anterior, resto = siguiente
+                    v.push(Widget::new(cx - 196.0 * s, ty, 130.0 * s, th_, WKind::Label, Act::BookPrev, ""));
+                    v.push(Widget::new(cx - 66.0 * s, ty, 262.0 * s, th_, WKind::Label, Act::BookNext, ""));
+                    let fy = y0 + 210.0 * s;
+                    v.push(Widget::new(cx - 196.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookChPrev, "«"));
+                    v.push(Widget::new(cx - 162.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookPrev, "‹"));
+                    v.push(Widget::new(cx + 132.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookNext, "›"));
+                    v.push(Widget::new(cx + 166.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookChNext, "»"));
+                } else {
+                    v.push(Widget::new(cx - 196.0 * s, ty, 392.0 * s, th_, WKind::Label, Act::BookOpen, ""));
+                }
+            }
             Page::Settings => {
                 let chips: [(&'static str, f32); 4] = [
                     ("Funciones", 86.0),
@@ -4044,6 +4587,7 @@ impl App {
                         toggle(&mut v, 3.0, F_SHADOW);
                         toggle(&mut v, 4.0, F_VIS);
                         toggle(&mut v, 5.0, F_COVER);
+                        selector(&mut v, 6.0, 4, "Acento", ACCENT_NAMES[self.cfg.accent as usize]);
                     }
                     2 => {
                         toggle(&mut v, 0.0, F_DRAG);
@@ -4136,12 +4680,14 @@ impl App {
             match wd.kind {
                 WKind::Tab(p) => {
                     if wd.on {
-                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.16 * f);
+                        let px = if th.tabs_center && self.tab_x >= 0.0 { self.tab_x } else { wd.x };
+                        cv.rrect(px, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.16 * f);
                     } else if hov {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.07 * f);
                     }
                     let col = if wd.on { th.fg } else { th.fg2 };
-                    cv.tab_icon(p, wd.x + 11.5 * s, cy, s, col, f);
+                    let ix = if th.tabs_center { cx } else { wd.x + 11.5 * s };
+                    cv.tab_icon(p, ix, cy, s, col, f);
                 }
                 WKind::Pin => {
                     if hov {
@@ -4163,6 +4709,9 @@ impl App {
                 WKind::Pill => {
                     let c2 = if hov { th.surface_hi } else { th.surface };
                     cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), c2, f);
+                    if wd.on {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), (255.0, 69.0, 58.0), 0.35 * f);
+                    }
                 }
                 WKind::Key(cls) => {
                     let base = match cls {
@@ -4175,7 +4724,13 @@ impl App {
                     } else {
                         base
                     };
-                    let rr = if th.sharp { 2.0 * s } else { 12.0 * s };
+                    let rr = if th.sharp {
+                        2.0 * s
+                    } else if th.tabs_center {
+                        wd.h / 2.0 // teclas en capsula (estilo Apple)
+                    } else {
+                        12.0 * s
+                    };
                     cv.rrect(wd.x, wd.y, wd.w, wd.h, rr, c2, f);
                 }
                 WKind::Toggle => {
@@ -4217,6 +4772,65 @@ impl App {
                     cv.rrect(cx - 7.0 * s, cy - 1.0 * s, 10.0 * s, 2.0 * s, 1.0 * s, col, f);
                     cv.rrect(cx - 7.0 * s, cy + 3.5 * s, 12.0 * s, 2.0 * s, 1.0 * s, col, f);
                 }
+                WKind::Heart => {
+                    if hov {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.07 * f);
+                    }
+                    let col = if hov { th.accent } else { th.fg2 };
+                    cv.circle(cx - 3.6 * s, cy - 2.4 * s, 4.2 * s, col, f);
+                    cv.circle(cx + 3.6 * s, cy - 2.4 * s, 4.2 * s, col, f);
+                    for i in 0..6 {
+                        let y = cy - 0.6 * s + i as f32 * 1.7 * s;
+                        let hw = (7.6 - i as f32 * 1.3) * s;
+                        cv.rrect(cx - hw, y - 0.9 * s, hw * 2.0, 1.8 * s, 0.9 * s, col, f);
+                    }
+                }
+                WKind::Dc(k) => {
+                    let c2 = if hov { th.surface_hi } else { th.surface };
+                    cv.rrect(wd.x, wd.y, wd.w, wd.h, 14.0 * s, c2, f);
+                    let red: Rgb = (255.0, 69.0, 58.0);
+                    if wd.on {
+                        cv.rrect(wd.x, wd.y, wd.w, wd.h, 14.0 * s, red, 0.22 * f);
+                    }
+                    let col = if wd.on { red } else { th.fg };
+                    let (ix, iy) = (cx, wd.y + 22.0 * s);
+                    let pi = std::f32::consts::PI;
+                    let tk = 2.0 * s;
+                    match k {
+                        0 => {
+                            cv.rrect(ix - 3.5 * s, iy - 11.0 * s, 7.0 * s, 13.0 * s, 3.5 * s, col, f);
+                            cv.arc(ix, iy - 1.0 * s, 7.0 * s, 0.0, pi, tk, col, f);
+                            cv.line(ix, iy + 6.0 * s, ix, iy + 10.0 * s, tk, col, f);
+                            cv.line(ix - 3.5 * s, iy + 10.0 * s, ix + 3.5 * s, iy + 10.0 * s, tk, col, f);
+                            if wd.on {
+                                cv.line(ix - 9.0 * s, iy - 10.0 * s, ix + 9.0 * s, iy + 11.0 * s, 2.4 * s, red, f);
+                            }
+                        }
+                        1 => {
+                            cv.arc(ix, iy + 1.0 * s, 8.5 * s, pi, 2.0 * pi, tk, col, f);
+                            cv.rrect(ix - 11.0 * s, iy + 0.5 * s, 5.0 * s, 9.0 * s, 2.5 * s, col, f);
+                            cv.rrect(ix + 6.0 * s, iy + 0.5 * s, 5.0 * s, 9.0 * s, 2.5 * s, col, f);
+                            if wd.on {
+                                cv.line(ix - 10.0 * s, iy - 10.0 * s, ix + 10.0 * s, iy + 11.0 * s, 2.4 * s, red, f);
+                            }
+                        }
+                        2 => {
+                            let col = (255.0, 69.0, 58.0);
+                            cv.arc(ix, iy + 4.0 * s, 9.0 * s, pi, 2.0 * pi, 3.2 * s, col, f);
+                            cv.rrect(ix - 12.0 * s, iy + 2.5 * s, 6.0 * s, 5.0 * s, 2.0 * s, col, f);
+                            cv.rrect(ix + 6.0 * s, iy + 2.5 * s, 6.0 * s, 5.0 * s, 2.0 * s, col, f);
+                        }
+                        _ => {
+                            cv.line(ix - 8.0 * s, iy - 7.0 * s, ix + 2.0 * s, iy - 7.0 * s, tk, col, f);
+                            cv.line(ix - 8.0 * s, iy + 8.0 * s, ix + 7.0 * s, iy + 8.0 * s, tk, col, f);
+                            cv.line(ix - 8.0 * s, iy - 7.0 * s, ix - 8.0 * s, iy + 8.0 * s, tk, col, f);
+                            cv.line(ix + 7.0 * s, iy + 8.0 * s, ix + 7.0 * s, iy + 1.0 * s, tk, col, f);
+                            cv.line(ix - 1.0 * s, iy + 1.0 * s, ix + 8.0 * s, iy - 8.0 * s, tk, col, f);
+                            cv.line(ix + 8.0 * s, iy - 8.0 * s, ix + 2.0 * s, iy - 8.0 * s, tk, col, f);
+                            cv.line(ix + 8.0 * s, iy - 8.0 * s, ix + 8.0 * s, iy - 2.0 * s, tk, col, f);
+                        }
+                    }
+                }
                 WKind::Selector => {
                     if hov {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.7 * f);
@@ -4237,7 +4851,13 @@ impl App {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.5 * f);
                     }
                     let (bx, by, bs) = (wd.x + 4.0 * s, cy - 8.0 * s, 16.0 * s);
-                    let rr = if th.sharp { 1.5 * s } else { 4.0 * s };
+                    let rr = if th.sharp {
+                        1.5 * s
+                    } else if th.tabs_center {
+                        bs / 2.0 // casilla redonda (estilo Apple)
+                    } else {
+                        4.0 * s
+                    };
                     if wd.on {
                         cv.rrect(bx, by, bs, bs, rr, th.accent, f);
                         cv.line(bx + 3.5 * s, by + 8.5 * s, bx + 6.8 * s, by + 12.0 * s, 2.0 * s, th.on_accent, f);
@@ -4653,6 +5273,39 @@ impl App {
                             self.txt(self.font_small, "Sin tareas. Escribe arriba y pulsa Enter.", cxm - 196.0 * s, y0 + 80.0 * s, cxm + 196.0 * s, y0 + 110.0 * s, fg2, f, center);
                         }
                     }
+                    Page::Book => {
+                        let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
+                        let plain = DT_SINGLELINE | DT_NOPREFIX | DT_LEFT | DT_VCENTER;
+                        match &self.book {
+                            Some(b) => {
+                                let head = if b.author.is_empty() { b.title.clone() } else { format!("{} · {}", b.title, b.author) };
+                                self.txt(self.font_small, &head, cxm - 124.0 * s, y0 + 37.0 * s, cxm + 124.0 * s, y0 + 59.0 * s, fg2, f, center);
+                                if let Some(page) = self.book_pages.get(self.book_page) {
+                                    for (k, l) in page.iter().enumerate() {
+                                        let t = y0 + 62.0 * s + k as f32 * BOOK_PITCH * s;
+                                        let (font, col, fmt) = if l.heading { (self.font_main, accent, center) } else { (self.font_small, fg, plain) };
+                                        self.txt(font, &l.text, lx, t, rx, t + BOOK_PITCH * s, col, f, fmt);
+                                    }
+                                }
+                                let ch = self.book_pos.0.min(b.chapters.len() - 1);
+                                let np = self.book_pages.len().max(1);
+                                let done = b.before[ch] as f32 + b.chapters[ch].chars as f32 * (self.book_page as f32 / np as f32);
+                                let pct = (done * 100.0 / b.total_chars as f32).floor().clamp(0.0, 100.0) as i32;
+                                self.txt(self.font_small, &format!("{}%", pct), rx - 64.0 * s, y0 + 37.0 * s, rx, y0 + 59.0 * s, fg2, f, right);
+                                let info = format!("Cap. {}/{} · pág. {}/{}", ch + 1, b.chapters.len(), self.book_page + 1, np);
+                                self.txt(self.font_small, &info, cxm - 126.0 * s, y0 + 210.0 * s, cxm + 126.0 * s, y0 + 234.0 * s, fg2, f, center);
+                            }
+                            None => {
+                                let (l1, l2) = match self.book_state {
+                                    1 => ("Abriendo libro…", ""),
+                                    3 => ("No se pudo abrir el libro", self.book_err.as_str()),
+                                    _ => ("Sin libro abierto", "Pulsa «Abrir…» y elige un archivo .epub"),
+                                };
+                                self.txt(self.font_main, l1, lx, y0 + 96.0 * s, rx, y0 + 122.0 * s, fg, f, center);
+                                self.txt(self.font_small, l2, lx, y0 + 124.0 * s, rx, y0 + 168.0 * s, fg2, f, center);
+                            }
+                        }
+                    }
                     Page::Weather => {
                         let wx = self.wx.lock().unwrap().clone();
                         let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
@@ -4750,6 +5403,9 @@ impl App {
                         self.txt(self.font_small, &info, lx, y0 + 102.0 * s, rx, y0 + 120.0 * s, fg2, f, center);
                         self.txt(self.font_small, "Ctrl+Alt+S captura · Ctrl+Alt+R graba/detiene", lx, y0 + 188.0 * s, rx, y0 + 204.0 * s, fg2, f, center);
                     }
+                    Page::Discord => {
+                        self.txt(self.font_small, "Atajos de Discord: Ctrl+Shift+M · Ctrl+Shift+D · Ctrl+Shift+X (desconectar)", cxm - 196.0 * s, y0 + 116.0 * s, cxm + 196.0 * s, y0 + 136.0 * s, fg2, f, center);
+                    }
                     Page::Settings => {}
                 }
 
@@ -4758,7 +5414,7 @@ impl App {
                     let (l, t, r, b) = (wd.x, wd.y, wd.x + wd.w, wd.y + wd.h);
                     match wd.kind {
                         WKind::Tab(_) => {
-                            if wd.on {
+                            if wd.on && !th.tabs_center {
                                 self.txt(self.font_small, wd.label, l + 23.0 * s, t, r, b, fg, f, left);
                             }
                         }
@@ -4768,10 +5424,18 @@ impl App {
                             self.txt(self.font_small, wd.label, l, t, r, b, col, f, center);
                         }
                         WKind::Lyric => {}
+                        WKind::Heart => {}
+                        WKind::Dc(_) => self.txt(self.font_small, wd.label, l, t + wd.h * 0.6, r, b - 2.0 * s, fg, f, center),
                         WKind::Source => {
                             let auto = self.cfg.source.is_empty();
                             let name = if m.source.is_empty() { "—".to_string() } else { m.source.clone() };
-                            let shown = if auto { format!("Auto · {}", name) } else { name };
+                            let shown = if !self.song_in_collapsed() {
+                                "Off".to_string()
+                            } else if auto {
+                                format!("Auto · {}", name)
+                            } else {
+                                name
+                            };
                             self.txt(self.font_small, &shown, l + 6.0 * s, t, r - 4.0 * s, b, fg2, f, center);
                         }
                         WKind::Key(cls) => {
@@ -4831,6 +5495,9 @@ impl App {
     fn render(&mut self) {
         if self.hidden {
             return;
+        }
+        if self.mode == Mode::Expanded && self.page == Page::Book {
+            self.book_ensure_pages();
         }
         let m = self.media.lock().unwrap().clone();
         let s = self.s;
@@ -4927,10 +5594,18 @@ impl App {
         }
 
         // contenido; el anterior se desvanece rapido mientras entra el nuevo
-        let f = smooth(self.fade);
+        // cambio de cancion: deslizamiento (la que termina sale a la izquierda y la nueva
+        // entra por la derecha, ambas hacia la izquierda), sin desvanecer
+        let slide = self.prev_media.is_some() && self.mode == Mode::Collapsed;
+        let p_slide = smooth(self.fade);
+        let f = if slide { 1.0 } else { smooth(self.fade) };
         let old = match self.prev_view {
             Some((pm, pp)) => {
-                let fo = smooth(1.0 - self.fade * 2.5);
+                let fo = if slide {
+                    if self.fade < 1.0 { 1.0 } else { 0.0 }
+                } else {
+                    smooth(1.0 - self.fade * 2.5)
+                };
                 if fo > 0.0 {
                     Some((pm, pp, fo))
                 } else {
@@ -4941,7 +5616,9 @@ impl App {
         };
         if old.is_none() {
             self.prev_view = None;
+            self.prev_media = None;
         }
+        let (ox_old, ox_new) = if slide { (-p_slide * w, (1.0 - p_slide) * w) } else { (0.0, 0.0) };
         let wl_new = self.layout(self.mode, self.page, &m);
         let wl_old = match old {
             Some((pm, pp, _)) => self.layout(pm, pp, &m),
@@ -4953,19 +5630,23 @@ impl App {
                 cv.frame(x0, y0, w, h, s);
             }
             if let Some((pm, pp, fo)) = old {
-                self.draw_software(&mut cv, &m, pm, pp, &wl_old, x0, y0, w, h, fo);
+                let om = self.prev_media.as_ref().unwrap_or(&m);
+                self.draw_software(&mut cv, om, pm, pp, &wl_old, x0 + ox_old, y0, w, h, fo);
             }
-            self.draw_software(&mut cv, &m, self.mode, self.page, &wl_new, x0, y0, w, h, f);
+            self.draw_software(&mut cv, &m, self.mode, self.page, &wl_new, x0 + ox_new, y0, w, h, f);
         }
         unsafe {
             if let Some((pm, pp, fo)) = old {
-                self.draw_text(&m, pm, pp, &wl_old, x0, y0, w, h, fo);
+                let om = self.prev_media.as_ref().unwrap_or(&m);
+                self.draw_text(om, pm, pp, &wl_old, x0 + ox_old, y0, w, h, fo);
             }
-            self.draw_text(&m, self.mode, self.page, &wl_new, x0, y0, w, h, f);
+            self.draw_text(&m, self.mode, self.page, &wl_new, x0 + ox_new, y0, w, h, f);
             let _ = GdiFlush();
         }
 
-        // alpha premultiplicado: pildora sobre sombra
+        // alpha premultiplicado: pildora sobre sombra. Durante el deslizamiento de canciones el
+        // contenido se pasa de los bordes: se enmascara en todo el ancho para que no se vea fuera.
+        let (sxa, sxb) = if slide { (0, pw) } else { (sxa, sxb) };
         for y in sya..syb {
             for x in sxa..sxb {
                 let i = y * pw + x;
@@ -5290,6 +5971,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 open_device_menu(hwnd, wp.0);
                 LRESULT(0)
             }
+            WM_APP_BOOK => {
+                with_app(|a| a.on_book());
+                LRESULT(0)
+            }
             WM_HOTKEY => {
                 match wp.0 {
                     1 => with_app(|a| a.take_shot()),
@@ -5368,8 +6053,8 @@ fn main() -> windows::core::Result<()> {
         *SOURCE_SEL.lock().unwrap() = cfg.source.clone();
         MUSIC_ON.store(features[F_MUSIC], Ordering::Relaxed);
         COVER_ON.store(features[F_COVER], Ordering::Relaxed);
-        let th = theme_of(cfg.theme);
-        let start = if cfg.style == 1 { home } else { POINT { x: home.x + cfg.dx, y: home.y + cfg.dy } };
+        let th = make_theme(&cfg);
+        let start = POINT { x: home.x + cfg.dx, y: home.y + cfg.dy };
 
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -5422,6 +6107,7 @@ fn main() -> windows::core::Result<()> {
         let n = (pw * ph) as usize;
         let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
         let now_t = GetLocalTime();
+        let book_saved = load_book_state();
         let app = App {
             hwnd,
             mem,
@@ -5514,6 +6200,19 @@ fn main() -> windows::core::Result<()> {
             slider_drag: None,
             drag: None,
             prev_fg: 0,
+            book: None,
+            book_state: 0,
+            book_err: String::new(),
+            book_path: book_saved.0,
+            book_pos: book_saved.1,
+            book_pages: Vec::new(),
+            book_page: 0,
+            dc_mute: false,
+            dc_deaf: false,
+            book_pk: (usize::MAX, 0, 0, 0),
+            tab_x: -1.0,
+            last_media: Media::default(),
+            prev_media: None,
         };
         APP.with(|c| *c.borrow_mut() = Some(app));
 

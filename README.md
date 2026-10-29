@@ -2,7 +2,7 @@ THIS PROJECT WAS MADE WITH AI FOR PERSONAL USE!
 
 # Dynamic Island for Windows
 
-A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, and screen capture controls.
+A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, an EPUB reader, and screen capture controls.
 
 > **Status:** in development. Intended for Windows 10/11.
 
@@ -19,10 +19,12 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
   - **Stopwatch**: tenths of a second and laps.
 - **Calculator**: clickable keys, parentheses, and a live result. Accepts keyboard input when the window has focus.
 - **Tasks**: a simple to-do list stored locally.
+- **Book (EPUB reader)**: open any `.epub` with *Open…* and read it right inside the island, a page at a time. Click the left part of the text (or `‹`) for the previous page and the rest (or `›`) for the next one; the mouse wheel also turns pages and `«` / `»` jump between chapters. Shows chapter, page and overall progress, and remembers where you stopped (and reopens the last book) in `%APPDATA%\DynamicIsland\book.ini`. Text only (no images/styles); no DRM support. No third-party crates: ZIP, inflate and XHTML parsing are built in (`src/epub.rs`).
 - **Battery alerts**: when the charger is connected/disconnected and when the battery drops below 20%.
 - **Volume**: mouse wheel over the island; middle-click to mute.
 - **Volume mixer**: master volume and per-application volume with mute buttons (Core Audio). Click an app's name (or right-click its name/mute icon) to choose which output device that app plays through.
 - **Media source**: a chip next to the controls cycles between the apps that expose media controls (Spotify, browsers, foobar2000, ...); *Auto* follows the system's current session.
+- **Apple theme** (Settings › Appearance › Theme): pure black, iOS greys and orange accent, Segoe UI Variable, and a centered icon-only tab bar with the bell and pin mirrored on each side.
 - **Hide in fullscreen** (games, videos).
 - **Dodge browser tabs** (optional): hold the mouse on the top edge of the screen over the island for one second and it slides down out of the way; it returns when the cursor moves away. It also works in Notch style: the notch detaches and becomes a floating island while it dodges (the very top row of pixels does not expand the notch, so you can park the cursor there).
 - **Screen capture**:
@@ -34,10 +36,10 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
 
 ## Usage
 
-Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · System · Capture · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
+Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · Book · System · Capture · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
 
 Configuration is stored in `%APPDATA%\DynamicIsland\config.ini`.
-Tasks are stored in `%APPDATA%\DynamicIsland\todo.txt`.
+Tasks are stored in `%APPDATA%\DynamicIsland\todo.txt`. The last book and reading position are stored in `%APPDATA%\DynamicIsland\book.ini`.
 
 ### Screenshots and recordings
 
@@ -88,6 +90,7 @@ The executable is placed at `target\release\dynamic_island.exe`. To exit, right-
 - Recording requires an available H.264 encoder (included with Windows 10/11).
 - Weather requires an internet connection; IP-based location is approximate.
 - The UI is designed for the top edge of the primary monitor.
+- The EPUB reader shows plain text only (no images, fonts or CSS), skips DRM-protected books, and splits pages for the island's current font and scale.
 
 ## Publishing a release
 

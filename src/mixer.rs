@@ -180,6 +180,27 @@ unsafe fn default_device() -> windows::core::Result<IMMDevice> {
     en.GetDefaultAudioEndpoint(eRender, eConsole)
 }
 
+/// Todas las salidas activas (predeterminada y virtuales como Voicemeeter): las apps pueden
+/// estar reproduciendo en cualquiera de ellas, no solo en la predeterminada.
+unsafe fn all_render_devices() -> Vec<IMMDevice> {
+    let mut v: Vec<IMMDevice> = Vec::new();
+    if let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+        if let Ok(coll) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
+            for i in 0..coll.GetCount().unwrap_or(0) {
+                if let Ok(d) = coll.Item(i) {
+                    v.push(d);
+                }
+            }
+        }
+    }
+    if v.is_empty() {
+        if let Ok(d) = default_device() {
+            v.push(d);
+        }
+    }
+    v
+}
+
 fn read() -> windows::core::Result<MixState> {
     unsafe {
         let dev = default_device()?;
@@ -187,26 +208,33 @@ fn read() -> windows::core::Result<MixState> {
         let master = ep.GetMasterVolumeLevelScalar()?;
         let muted = ep.GetMute()?.as_bool();
 
-        let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None)?;
-        let en = mgr.GetSessionEnumerator()?;
-        let n = en.GetCount()?;
         let mut apps: Vec<AppVol> = Vec::new();
-        for i in 0..n {
-            let Ok(ctl) = en.GetSession(i) else { continue };
-            let Ok(state) = ctl.GetState() else { continue };
-            if state == AudioSessionStateExpired {
-                continue;
-            }
-            let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-            let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() else { continue };
-            let name = session_name(&ctl, &ctl2);
-            let v = vol.GetMasterVolume().unwrap_or(1.0);
-            let m = vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-            let active = state == AudioSessionStateActive;
-            if let Some(a) = apps.iter_mut().find(|a| a.name == name) {
-                a.active |= active;
-            } else {
-                apps.push(AppVol { name, vol: v, muted: m, active });
+        for d in all_render_devices() {
+            let Ok(mgr) = d.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+            let Ok(en) = mgr.GetSessionEnumerator() else { continue };
+            let n = en.GetCount().unwrap_or(0);
+            for i in 0..n {
+                let Ok(ctl) = en.GetSession(i) else { continue };
+                let Ok(state) = ctl.GetState() else { continue };
+                if state == AudioSessionStateExpired {
+                    continue;
+                }
+                let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+                let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() else { continue };
+                let name = session_name(&ctl, &ctl2);
+                // Voicemeeter (la propia mezcladora) no se lista: solo sirve para subir/bajar todo
+                if name.to_lowercase().starts_with("voicemeeter") {
+                    continue;
+                }
+                let v = vol.GetMasterVolume().unwrap_or(1.0);
+                let m = vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+                let active = state == AudioSessionStateActive;
+                // la misma app en varias salidas: una sola fila, que manda sobre todas
+                if let Some(a) = apps.iter_mut().find(|a| a.name == name) {
+                    a.active |= active;
+                } else {
+                    apps.push(AppVol { name, vol: v, muted: m, active });
+                }
             }
         }
         // primero las que suenan, luego orden alfabético
@@ -232,7 +260,7 @@ fn apply(c: &Cmd) {
             }
             Cmd::App(name, v) => {
                 let v = v.clamp(0.0, 1.0);
-                for_sessions(&dev, name, |vol| {
+                for_sessions(name, |vol| {
                     let _ = vol.SetMasterVolume(v, std::ptr::null());
                 });
             }
@@ -244,7 +272,7 @@ fn apply(c: &Cmd) {
             }
             Cmd::AppMute(name, m) => {
                 let m = *m;
-                for_sessions(&dev, name, |vol| {
+                for_sessions(name, |vol| {
                     let _ = vol.SetMute(BOOL::from(m), std::ptr::null());
                 });
             }
@@ -252,18 +280,21 @@ fn apply(c: &Cmd) {
     }
 }
 
-unsafe fn for_sessions(dev: &IMMDevice, name: &str, f: impl Fn(&ISimpleAudioVolume)) {
-    let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { return };
-    let Ok(en) = mgr.GetSessionEnumerator() else { return };
-    let n = en.GetCount().unwrap_or(0);
-    for i in 0..n {
-        let Ok(ctl) = en.GetSession(i) else { continue };
-        let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-        if session_name(&ctl, &ctl2) != name {
-            continue;
-        }
-        if let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() {
-            f(&vol);
+/// Aplica `f` a las sesiones de la app `name` en todas las salidas activas.
+unsafe fn for_sessions(name: &str, f: impl Fn(&ISimpleAudioVolume)) {
+    for dev in all_render_devices() {
+        let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+        let Ok(en) = mgr.GetSessionEnumerator() else { continue };
+        let n = en.GetCount().unwrap_or(0);
+        for i in 0..n {
+            let Ok(ctl) = en.GetSession(i) else { continue };
+            let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+            if session_name(&ctl, &ctl2) != name {
+                continue;
+            }
+            if let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() {
+                f(&vol);
+            }
         }
     }
 }
@@ -430,18 +461,19 @@ fn get_persisted(pid: u32) -> Option<String> {
 
 unsafe fn pids_for(app: &str) -> Vec<u32> {
     let mut v: Vec<u32> = Vec::new();
-    let Ok(dev) = default_device() else { return v };
-    let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { return v };
-    let Ok(en) = mgr.GetSessionEnumerator() else { return v };
-    for i in 0..en.GetCount().unwrap_or(0) {
-        let Ok(ctl) = en.GetSession(i) else { continue };
-        let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-        if session_name(&ctl, &ctl2) != app {
-            continue;
-        }
-        let pid = ctl2.GetProcessId().unwrap_or(0);
-        if pid != 0 && !v.contains(&pid) {
-            v.push(pid);
+    for dev in all_render_devices() {
+        let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+        let Ok(en) = mgr.GetSessionEnumerator() else { continue };
+        for i in 0..en.GetCount().unwrap_or(0) {
+            let Ok(ctl) = en.GetSession(i) else { continue };
+            let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+            if session_name(&ctl, &ctl2) != app {
+                continue;
+            }
+            let pid = ctl2.GetProcessId().unwrap_or(0);
+            if pid != 0 && !v.contains(&pid) {
+                v.push(pid);
+            }
         }
     }
     v
