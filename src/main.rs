@@ -5,7 +5,6 @@
 //! Temas (Clasico / NieR), estilo isla o notch, mover libremente, opacidad por
 //! proximidad, fuente elegible. Configuracion en %APPDATA%\DynamicIsland\config.ini.
 
-mod capture;
 mod epub;
 mod mixer;
 mod system;
@@ -48,13 +47,12 @@ use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTimeAsFil
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, GetAsyncKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
-    UnregisterHotKey, HOT_KEY_MODIFIERS, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT,
+    keybd_event, GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
-        NIM_DELETE, NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+    NIM_DELETE, NOTIFYICONDATAW, QUNS_BUSY, QUNS_PRESENTATION_MODE,
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -255,12 +253,11 @@ const F_DRAG: usize = 16;
 const F_LYRMODE: usize = 17;
 const F_WEATHER: usize = 18;
 const F_SYSTEM: usize = 19;
-const F_CAPTURE: usize = 20;
-const F_DODGE: usize = 21;
-const F_MIXER: usize = 22;
-const F_BOOK: usize = 23;
-const F_COLOR: usize = 24;
-const F_COUNT: usize = 25;
+const F_DODGE: usize = 20;
+const F_MIXER: usize = 21;
+const F_BOOK: usize = 22;
+const F_COLOR: usize = 23;
+const F_COUNT: usize = 24;
 
 // Pomodoro: enfoque 25 min, descanso corto 5 min y descanso largo 15 min cada 4 rondas.
 const POMO_WORK: u64 = 25 * 60;
@@ -289,7 +286,6 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("lyricmode", "Letra en la isla"),
     ("weather", "Clima"),
     ("system", "Sistema"),
-    ("capture", "Captura de pantalla"),
     ("dodge", "Esquivar pestañas web"),
     ("mixer", "Mezclador de volumen"),
     ("book", "Lector de EPUB"),
@@ -446,7 +442,6 @@ enum Page {
     Book,
     Color,
     System,
-    Capture,
     Settings,
 }
 
@@ -498,7 +493,6 @@ enum Act {
     WeatherRefresh,
     WeatherLocate,
     Shot,
-    OpenShots,
     MixMute(usize),
     MixDevice(usize),
     Source,
@@ -687,7 +681,6 @@ struct App {
     mixer: Option<mixer::Mixer>,
     mix_override: f32, // valor mostrado mientras se arrastra un deslizador del mezclador
     mix_last: f32,
-    last_shot: String,
     slider_drag: Option<u8>,
     drag: Option<DragState>,
     prev_fg: isize,
@@ -1921,11 +1914,6 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
-fn open_folder(p: &std::path::Path) {
-    let _ = std::fs::create_dir_all(p);
-    let _ = std::process::Command::new("explorer").arg(p).spawn();
-}
-
 fn fmt_timer(secs: f32) -> String {
     let t = secs.max(0.0).ceil() as u64;
     if t >= 3600 {
@@ -2281,12 +2269,6 @@ impl<'a> Canvas<'a> {
                 self.circle(cx + 4.0 * s, cy - 4.0 * s, 3.6 * s, col, f);
                 self.circle(cx - 6.5 * s, cy + 6.5 * s, 1.6 * s, col, f);
             }
-            Page::Capture => {
-                self.rrect(cx - 7.0 * s, cy - 4.0 * s, 14.0 * s, 10.0 * s, 2.2 * s, col, f);
-                self.rrect(cx - 2.8 * s, cy - 6.5 * s, 5.6 * s, 3.0 * s, 1.0 * s, col, f);
-                self.circle(cx, cy + 1.0 * s, 3.3 * s, col, f);
-                self.circle(cx, cy + 1.0 * s, 1.7 * s, bg, f);
-            }
             Page::Settings => {
                 for (i, kx) in [-3.0f32, 3.5, -1.0].iter().enumerate() {
                     let y = cy + (i as f32 - 1.0) * 4.6 * s;
@@ -2358,7 +2340,6 @@ impl App {
             Page::Todo => self.feat(F_TODO),
             Page::Book => self.feat(F_BOOK),
             Page::System => self.feat(F_SYSTEM),
-            Page::Capture => self.feat(F_CAPTURE),
             Page::Color => self.feat(F_COLOR),
             Page::Mixer => self.feat(F_MIXER),
             Page::Settings => true,
@@ -2378,7 +2359,6 @@ impl App {
             Page::Calc,
             Page::Todo,
             Page::System,
-            Page::Capture,
         ] {
             if self.page_enabled(p) {
                 return p;
@@ -2569,7 +2549,6 @@ impl App {
                 Page::Book => (EW, 246.0),
                 Page::Weather => (EW, 250.0),
                 Page::System => (EW, 252.0),
-                Page::Capture => (EW, 170.0),
                 Page::Color => (EW, 158.0),
                 Page::Mixer => {
                     let n = self.mixer.as_ref().map(|mx| mx.state().apps.len()).unwrap_or(0).clamp(1, 6) as f32;
@@ -3794,44 +3773,6 @@ impl App {
         self.changed();
     }
 
-    // ---- captura y grabación
-
-    fn take_shot(&mut self) {
-        if !self.feat(F_CAPTURE) {
-            return;
-        }
-        let (x, y, w, h) = capture::virtual_screen();
-        if w < 2 || h < 2 {
-            self.show_toast(false, "No se pudo medir la pantalla".into(), 4);
-            return;
-        }
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-        std::thread::sleep(Duration::from_millis(140));
-        let shot = capture::grab(x, y, w, h);
-        if !self.hidden {
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            }
-        }
-        match (shot, capture::new_shot_path()) {
-            (Ok(s), Ok(p)) => match capture::save_png(&s, &p) {
-                Ok(()) => {
-                    self.last_shot = p.display().to_string();
-                    unsafe {
-                        let _ = MessageBeep(MB_OK);
-                    }
-                    self.show_toast(false, "Captura guardada".into(), 3);
-                }
-                Err(e) => self.show_toast(false, format!("Error al guardar: {e}"), 6),
-            },
-            (Err(e), _) => self.show_toast(false, format!("Error de captura: {e}"), 6),
-            (_, Err(e)) => self.show_toast(false, format!("Error: {e}"), 6),
-        }
-        self.changed();
-    }
-
     fn do_act(&mut self, act: Act) {
         let now = Instant::now();
         match act {
@@ -4055,11 +3996,6 @@ impl App {
             }
             Act::WeatherRefresh => self.start_weather(0),
             Act::WeatherLocate => self.start_weather(2),
-            Act::Shot => {
-                self.take_shot();
-                return;
-            }
-            Act::OpenShots => open_folder(&capture::pictures_dir()),
             Act::MixMute(i) => {
                 if let Some(mx) = &self.mixer {
                     let st = mx.state();
@@ -4233,15 +4169,6 @@ impl App {
                     self.sys = self.sys_sampler.sample();
                 }
             }
-            F_CAPTURE => {
-                if on {
-                    if !register_hotkeys(self.hwnd) {
-                        self.show_toast(false, "Atajo ocupado: usa el menú de la bandeja".into(), 6);
-                    }
-                } else {
-                    unregister_hotkeys(self.hwnd);
-                }
-            }
             _ => {}
         }
         save_config(&self.features, &self.cfg);
@@ -4268,10 +4195,6 @@ impl App {
                 self.apply_pos();
                 save_config(&self.features, &self.cfg);
             }
-            160 => {
-                self.take_shot();
-            }
-            162 => open_folder(&capture::pictures_dir()),
             200..=299 => {
                 let i = (id - 200) as usize;
                 if i < F_COUNT {
@@ -4449,7 +4372,6 @@ impl App {
             (Page::Book, "Libro", 36.0),
             (Page::Color, "Color", 40.0),
             (Page::System, "Sistema", 46.0),
-            (Page::Capture, "Captura", 50.0),
             (Page::Settings, "Ajustes", 48.0),
         ];
         const TAB_W: f32 = 22.0;
@@ -4654,7 +4576,7 @@ impl App {
                 };
                 // columna 1: pestañas
                 card(&mut v, 0, top, total_h, "Pestañas");
-                for (k, fi) in [F_MUSIC, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_BOOK, F_COLOR, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER]
+                for (k, fi) in [F_MUSIC, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_BOOK, F_COLOR, F_WEATHER, F_SYSTEM, F_MIXER]
                     .iter()
                     .enumerate()
                 {
@@ -4729,10 +4651,6 @@ impl App {
                     // clic en el nombre (o clic derecho en nombre/silencio): salida de audio de la app
                     v.push(Widget::new(cx - 170.0 * s, y, 110.0 * s, 26.0 * s, WKind::Selector, Act::MixDevice(i + 1), ""));
                 }
-            }
-            Page::Capture => {
-                v.push(Widget::new(cx - 196.0 * s, y0 + 42.0 * s, 392.0 * s, 32.0 * s, WKind::Pill, Act::Shot, "Captura de pantalla"));
-                v.push(Widget::new(cx - 196.0 * s, y0 + 126.0 * s, 392.0 * s, 24.0 * s, WKind::Pill, Act::OpenShots, "Abrir capturas"));
             }
         }
         v
@@ -5493,16 +5411,6 @@ impl App {
                             self.txt(self.font_small, &pct(ov(11 + i as u8, a.vol)), cxm + 160.0 * s, yy, cxm + 208.0 * s, yy + 26.0 * s, fg2, f, left);
                         }
                     }
-                    Page::Capture => {
-                        let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
-                        self.txt(self.font_small, "Listo. Ctrl+Alt+S captura toda la pantalla.", lx, y0 + 82.0 * s, rx, y0 + 102.0 * s, fg, f, center);
-                        let info = if !self.last_shot.is_empty() {
-                            format!("Última captura: {}", tail_chars(&self.last_shot, 52))
-                        } else {
-                            "Se guardan en Imágenes\\DynamicIsland".to_string()
-                        };
-                        self.txt(self.font_small, &info, lx, y0 + 102.0 * s, rx, y0 + 120.0 * s, fg2, f, center);
-                    }
                     Page::Settings => {}
                 }
 
@@ -5845,21 +5753,6 @@ fn tray_remove(hwnd: HWND) {
     }
 }
 
-/// Cambia el texto flotante del icono de la bandeja (por ejemplo, al grabar).
-/// Ctrl+Alt+S captura la pantalla. Devuelve false si el atajo esta ocupado.
-fn register_hotkeys(hwnd: HWND) -> bool {
-    unsafe {
-        let mods = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_NOREPEAT.0);
-        RegisterHotKey(hwnd, 1, mods, 'S' as u32).is_ok()
-    }
-}
-
-fn unregister_hotkeys(hwnd: HWND) {
-    unsafe {
-        let _ = UnregisterHotKey(hwnd, 1);
-    }
-}
-
 /// Menu con las salidas de audio disponibles para una aplicacion del mezclador.
 fn open_device_menu(hwnd: HWND, idx: usize) {
     let mut target: Option<(mixer::Mixer, String)> = None;
@@ -5938,9 +5831,6 @@ fn show_menu(hwnd: HWND) -> i32 {
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Funciones"));
         }
         let _ = AppendMenuW(menu, MF_STRING, 150, w!("Restablecer posición"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, 160, w!("Captura de pantalla\tCtrl+Alt+S"));
-        let _ = AppendMenuW(menu, MF_STRING, 162, w!("Abrir capturas"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let fl = if auto { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, fl, 120, w!("Iniciar con Windows"));
@@ -6061,20 +5951,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 with_app(|a| a.on_book());
                 LRESULT(0)
             }
-            WM_HOTKEY => {
-                match wp.0 {
-                    1 => with_app(|a| a.take_shot()),
-                    _ => {}
-                }
-                LRESULT(0)
-            }
             WM_MOUSEACTIVATE => {
                 let mut ed = false;
                 with_app(|a| ed = a.editing);
                 LRESULT(if ed { MA_ACTIVATE_ } else { MA_NOACTIVATE_ })
             }
             WM_DESTROY => {
-                let _ = UnregisterHotKey(hwnd, 1);
                 tray_remove(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -6273,7 +6155,6 @@ fn main() -> windows::core::Result<()> {
             mixer: None,
             mix_override: 0.0,
             mix_last: -1.0,
-            last_shot: String::new(),
             slider_drag: None,
             drag: None,
             prev_fg: 0,
@@ -6306,10 +6187,6 @@ fn main() -> windows::core::Result<()> {
             a.apply_pos();
             a.ensure_page();
             a.render();
-            if a.feat(F_CAPTURE) && !register_hotkeys(a.hwnd) {
-                a.show_toast(false, "Atajo ocupado: usa el menú de la bandeja".into(), 6);
-                a.render();
-            }
             if a.feat(F_WEATHER) {
                 a.ensure_weather();
             }

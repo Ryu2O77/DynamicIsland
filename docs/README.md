@@ -2,7 +2,7 @@ THIS PROJECT WAS MADE WITH AI FOR PERSONAL USE!
 
 # Dynamic Island for Windows
 
-A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, an EPUB reader, a color picker, and screenshot controls.
+A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, an EPUB reader, and a color picker.
 
 > **Status:** in development. Intended for Windows 10/11.
 
@@ -29,16 +29,13 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
 - **Smooth song changes**: when the song changes with the island closed, the previous title/cover fades out while the new one fades in.
 - **Hide in fullscreen** (games, videos).
 - **Dodge browser tabs** (optional): hold the mouse on the top edge of the screen over the island for one second and it slides down out of the way; it returns when the cursor moves away. It also works in Notch style: the notch detaches and becomes a floating island while it dodges (the very top row of pixels does not expand the notch, so you can park the cursor there).
-- **Screen capture**:
-  - `Ctrl+Alt+S` takes a screenshot of the entire virtual desktop (all monitors) and saves it as PNG.
-  - The island hides itself for an instant while capturing so it does not appear in the image.
-- **Tray icon** with a menu for settings, capture actions, and exit.
+- **Tray icon** with a menu for settings, features, and exit.
 - **Color**: the eyedropper follows the cursor anywhere on screen: click or press Enter to pick (Esc cancels); the hex code is copied to the clipboard and the last 12 colors are kept in `%APPDATA%\\DynamicIsland\\colors.txt`.
 - **Settings**: every feature can be enabled or disabled from the *Settings* tab or the tray menu.
 
 ## Usage
 
-Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · Book · Color · System · Capture · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
+Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · Book · Color · System · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
 
 ### How to use each tab
 
@@ -52,23 +49,10 @@ Hover over the island to expand it and use the tab bar (**Music · Clock · Cale
 - **Book**: click the title to open an `.epub`. Click the left of the text for the previous page and the right for the next one (the wheel works too). `«` `»` change chapter, the label at the bottom opens the chapter list and *Aa* changes the text size. It remembers where you stopped.
 - **Color**: *Cuentagotas* follows the cursor over the whole screen; click or `Enter` picks the color, `Esc` cancels. The hex code is copied and the last 12 colors are kept; click one to copy it again.
 - **System**: live CPU, memory, disk and network.
-- **Capture**: takes a screenshot (`Ctrl+Alt+S` also works from anywhere); the bottom button opens the folder.
 - **Settings**: three columns: tabs and extras, appearance (theme, style, font, accent) and behavior/weather. Drag the island to move it; *Restablecer* puts it back.
 
 Configuration is stored in `%APPDATA%\DynamicIsland\config.ini`.
 Tasks are stored in `%APPDATA%\DynamicIsland\todo.txt`. The last book and reading position are stored in `%APPDATA%\DynamicIsland\book.ini`.
-
-### Screenshots
-
-- Screenshots: `%USERPROFILE%\Pictures\DynamicIsland\Captura_YYYY-MM-DD_HH-MM-SS.png`
-
-The folder can also be opened from the tray menu.
-
-### Keyboard shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `Ctrl+Alt+S` | Take a screenshot |
 
 ## Download
 
@@ -94,12 +78,9 @@ The executable is placed at `target\release\dynamic_island.exe`. To exit, right-
 - Animation is a spring synchronized with the desktop compositor (DWM) and runs only while something is moving; idle CPU usage is essentially zero.
 - Media information and controls use the Windows media transport controls (WinRT).
 - Weather uses native WinHTTP with TLS 1.2/1.3 and Open-Meteo.
-- Screenshots use GDI `BitBlt` and the Windows Imaging Component (WIC) PNG encoder.
-- No third-party capture tools are used.
 
 ## Limitations
 
-- Screenshots capture the full virtual desktop (all monitors).
 - Weather requires an internet connection; IP-based location is approximate.
 - The UI is designed for the top edge of the primary monitor.
 - The EPUB reader shows plain text only (no images, fonts or CSS), skips DRM-protected books, and splits pages for the island's current font and scale.

@@ -1,6 +1,6 @@
 # Documentación de Dynamic Island
 
-Isla dinámica para Windows escrita en Rust: una píldora negra anclada al borde superior de la pantalla que se expande al pasar el mouse y reúne música con letras sincronizadas, reloj y clima, calendario, temporizadores, calculadora, tareas, lector de EPUB, selector de color, estadísticas del sistema, capturas de pantalla y un mezclador de volumen.
+Isla dinámica para Windows escrita en Rust: una píldora negra anclada al borde superior de la pantalla que se expande al pasar el mouse y reúne música con letras sincronizadas, reloj y clima, calendario, temporizadores, calculadora, tareas, lector de EPUB, selector de color, estadísticas del sistema y un mezclador de volumen.
 
 > Proyecto hecho con IA para uso personal. Solo funciona en Windows 10/11.
 
@@ -110,9 +110,6 @@ Escribe y pulsa `Enter` para añadir. Clic en una tarea para marcarla como hecha
 ### Sistema
 Cuadrícula de 2×2 tarjetas estilo Apple: **CPU** y **Memoria** (anillo de progreso con gráfico del último minuto), **Disco C:** (anillo con espacio libre y total) y **Red** (velocidades de bajada y subida). Al pie, el tiempo encendido y la batería.
 
-### Captura
-Captura la pantalla completa (todos los monitores) y la guarda como PNG. El botón inferior abre la carpeta de capturas.
-
 ### Ajustes
 Ver la sección siguiente.
 
@@ -124,7 +121,7 @@ La pestaña se organiza en **tres columnas de tarjetas**:
 
 | Columna | Contenido |
 | --- | --- |
-| **Pestañas** | Activar o desactivar Música, Reloj, Calendario, Pomodoro y timer, Cronómetro, Calculadora, Tareas, Libro, Color, Clima, Sistema, Captura y Mezclador. |
+| **Pestañas** | Activar o desactivar Música, Reloj, Calendario, Pomodoro y timer, Cronómetro, Calculadora, Tareas, Libro, Color, Clima, Sistema y Mezclador. |
 | **Extras / Apariencia** | *Extras*: Letras, Letra en la isla, Notificaciones (botón de campana) y Aviso de batería. *Apariencia*: Tema, Estilo, Fuente, Acento, Sombra, Visualizador y Carátula. |
 | **Comportamiento / Clima** | *Comportamiento*: Mover libremente, Posición (Restablecer), Opacidad por proximidad (opacidad mínima y distancia), Ocultar en fullscreen, Volumen con la rueda, Iniciar con Windows y Esquivar pestañas web. *Clima*: ciudad (con Buscar), unidades, detectar ubicación y actualizar. |
 
@@ -145,8 +142,6 @@ Todo vive en `%APPDATA%\DynamicIsland\`:
 | `book.ini` | Último libro abierto y posición (`path`, `chapter`, `para`, `off`). |
 | `colors.txt` | Historial de colores, un hex (`RRGGBB`) por línea, el más reciente primero. |
 
-Las capturas se guardan en `%USERPROFILE%\Pictures\DynamicIsland\Captura_AAAA-MM-DD_HH-MM-SS.png`.
-
 Borrar un archivo restablece su contenido a los valores por defecto. Las claves desconocidas en `config.ini` se ignoran.
 
 ---
@@ -155,10 +150,9 @@ Borrar un archivo restablece su contenido a los valores por defecto. Las claves 
 
 | Atajo | Acción |
 | --- | --- |
-| `Ctrl+Alt+S` | Captura de pantalla (global). Si el atajo está ocupado, la isla avisa y se puede usar el menú de la bandeja. |
 | `Alt+Shift+B` | Lo envía la isla a Spotify con el botón del corazón. |
 
-**Menú de la bandeja / clic derecho:** Ajustes, submenú *Funciones*, *Restablecer posición*, *Captura de pantalla*, *Abrir capturas*, *Iniciar con Windows* y *Salir*.
+**Menú de la bandeja / clic derecho:** Ajustes, submenú *Funciones*, *Restablecer posición*, *Iniciar con Windows* y *Salir*.
 
 ---
 
@@ -173,7 +167,6 @@ Borrar un archivo restablece su contenido a los valores por defecto. Las claves 
 | `src/mixer.rs` | Mezclador con Core Audio: enumeración de dispositivos y sesiones de audio, volumen/silencio, cambio de salida por aplicación. |
 | `src/system.rs` | Estadísticas: CPU, RAM, disco, red y tiempo encendido con APIs nativas. |
 | `src/weather.rs` | Clima con WinHTTP (TLS 1.2/1.3) y Open-Meteo; búsqueda de ciudad y ubicación por IP. |
-| `src/capture.rs` | Captura con GDI (`BitBlt`) y codificación PNG con WIC a través de WinRT. |
 
 ### 8.2 Ventana y renderizado
 
@@ -260,13 +253,11 @@ Añade una entrada a `THEMES` y su nombre a `THEME_NAMES`; el selector de Ajuste
 ## 10. Limitaciones y solución de problemas
 
 - Solo Windows 10/11. La interfaz está pensada para el borde superior del monitor principal.
-- **Capturas:** abarcan todo el escritorio virtual (todos los monitores).
 - **Clima:** requiere conexión; la ubicación por IP es aproximada.
 - **Letras:** dependen de un servicio en línea y no siempre existen para todas las canciones.
 - **Corazón de Spotify:** depende del atajo de la aplicación de escritorio y no refleja el estado real del "me gusta".
 - **EPUB:** solo texto, sin imágenes ni CSS, y sin soporte de DRM. La paginación se recalcula con la fuente y la escala actuales.
 - **Cuentagotas:** la pantalla se lee con GDI; algunos contenidos protegidos o aceleración por hardware pueden devolver negro.
-- **El atajo `Ctrl+Alt+S` no responde:** otra aplicación lo tiene reservado. Usa el menú de la bandeja.
 - **No aparecen aplicaciones en el mezclador:** solo se listan las que tienen una sesión de audio en Windows; si una aplicación no ha reproducido sonido todavía, puede no aparecer hasta que lo haga.
 - **Error de compilación "Acceso denegado":** la isla sigue en ejecución; ciérrala antes de recompilar.
 - **Restablecer todo:** cierra la isla y borra `%APPDATA%\DynamicIsland\`.
