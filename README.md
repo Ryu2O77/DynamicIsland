@@ -2,7 +2,7 @@ THIS PROJECT WAS MADE WITH AI FOR PERSONAL USE!
 
 # Dynamic Island for Windows
 
-A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, an EPUB reader, and screen capture controls.
+A lightweight "dynamic island" for Windows written in Rust: a black pill anchored to the top edge of the screen that expands on hover and shows music with synchronized lyrics, clock with weather, calendar, system stats, pomodoro/timer/stopwatch, calculator, tasks, an EPUB reader, a color picker, and screenshot controls.
 
 > **Status:** in development. Intended for Windows 10/11.
 
@@ -19,41 +19,56 @@ A lightweight "dynamic island" for Windows written in Rust: a black pill anchore
   - **Stopwatch**: tenths of a second and laps.
 - **Calculator**: clickable keys, parentheses, and a live result. Accepts keyboard input when the window has focus.
 - **Tasks**: a simple to-do list stored locally.
-- **Book (EPUB reader)**: open any `.epub` with *Open…* and read it right inside the island, a page at a time. Click the left part of the text (or `‹`) for the previous page and the rest (or `›`) for the next one; the mouse wheel also turns pages and `«` / `»` jump between chapters. Shows chapter, page and overall progress, and remembers where you stopped (and reopens the last book) in `%APPDATA%\DynamicIsland\book.ini`. Text only (no images/styles); no DRM support. No third-party crates: ZIP, inflate and XHTML parsing are built in (`src/epub.rs`).
+- **Book (EPUB reader)**: open any `.epub` with *Open…* and read it right inside the island, a page at a time. Click the left part of the text (or `‹`) for the previous page and the rest (or `›`) for the next one; the mouse wheel also turns pages `«` / `»` jump between chapters, clicking the chapter/page label at the bottom opens the chapter list (wheel to scroll, click to jump; *Open…* appears there to switch books) and *Aa* cycles the text size (saved in `config.ini`). Shows chapter, page and overall progress, and remembers where you stopped (and reopens the last book) in `%APPDATA%\DynamicIsland\book.ini`. Text only (no images/styles); no DRM support. No third-party crates: ZIP, inflate and XHTML parsing are built in (`src/epub.rs`).
 - **Battery alerts**: when the charger is connected/disconnected and when the battery drops below 20%.
 - **Volume**: mouse wheel over the island; middle-click to mute.
 - **Volume mixer**: master volume and per-application volume with mute buttons (Core Audio). Click an app's name (or right-click its name/mute icon) to choose which output device that app plays through.
 - **Media source**: a chip next to the controls cycles between the apps that expose media controls (Spotify, browsers, foobar2000, ...); *Auto* follows the system's current session.
-- **Apple theme** (Settings › Appearance › Theme): pure black, iOS greys and orange accent, Segoe UI Variable, and a centered icon-only tab bar with the bell and pin mirrored on each side.
+- **Default look (Apple-inspired)**: pure black, iOS greys and orange accent, Segoe UI Variable, and a centered icon-only tab bar with the bell and pin mirrored on each side, capsule calculator keys (grey functions, orange operators) and round task check circles.
+- **Movable notch**: with *Move freely* on, the notch can be dragged anywhere. Dragged sideways it stays attached to the top edge; pulled down it detaches into a floating island, and dropping it near the top edge snaps it back. *Reset position* recenters it.
+- **Smooth song changes**: when the song changes with the island closed, the previous title/cover fades out while the new one fades in.
 - **Hide in fullscreen** (games, videos).
 - **Dodge browser tabs** (optional): hold the mouse on the top edge of the screen over the island for one second and it slides down out of the way; it returns when the cursor moves away. It also works in Notch style: the notch detaches and becomes a floating island while it dodges (the very top row of pixels does not expand the notch, so you can park the cursor there).
 - **Screen capture**:
   - `Ctrl+Alt+S` takes a screenshot of the entire virtual desktop (all monitors) and saves it as PNG.
-  - `Ctrl+Alt+R` starts/stops a 30 fps H.264/MP4 recording of the primary monitor.
-  - The island hides itself during capture/recording by default.
+  - The island hides itself for an instant while capturing so it does not appear in the image.
 - **Tray icon** with a menu for settings, capture actions, and exit.
+- **Color**: the eyedropper follows the cursor anywhere on screen: click or press Enter to pick (Esc cancels); the hex code is copied to the clipboard and the last 12 colors are kept in `%APPDATA%\\DynamicIsland\\colors.txt`.
 - **Settings**: every feature can be enabled or disabled from the *Settings* tab or the tray menu.
 
 ## Usage
 
-Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · Book · System · Capture · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
+Hover over the island to expand it and use the tab bar (**Music · Clock · Calendar · Weather · Time · Calc · Tasks · Book · Color · System · Capture · Settings**). The dot on the far right keeps it open (*pin*). Right-click the island or the tray icon to open the menu.
+
+### How to use each tab
+
+- **Music**: controls whatever is playing in any app. Click the progress bar to seek. The lyrics button shows synced lyrics, the heart sends Spotify's *Save to Your Library* shortcut (`Alt+Shift+B`; needs the Spotify window open) and the chip on the left picks the media source (or *Off* to hide the song on the closed island).
+- **Clock / Weather**: time, weather and battery. Set the city, units and location in *Settings*.
+- **Calendar**: arrows change the month and *Today* jumps back to the current one.
+- **Time**: choose Pomodoro, Timer or Stopwatch from the sub-tabs; Timer presets set the duration in one click, and the countdown stays visible when the island is closed.
+- **Volume**: master and per-app sliders; the speaker mutes, and clicking an app's name changes its output device.
+- **Calc**: use the keys or the keyboard (`Enter` = equals, `Esc`/`C` clears, `Backspace` deletes a digit).
+- **Tasks**: type and press `Enter` to add; click a task to mark it done, use the bin to delete it, wheel to scroll.
+- **Book**: click the title to open an `.epub`. Click the left of the text for the previous page and the right for the next one (the wheel works too). `«` `»` change chapter, the label at the bottom opens the chapter list and *Aa* changes the text size. It remembers where you stopped.
+- **Color**: *Cuentagotas* follows the cursor over the whole screen; click or `Enter` picks the color, `Esc` cancels. The hex code is copied and the last 12 colors are kept; click one to copy it again.
+- **System**: live CPU, memory, disk and network.
+- **Capture**: takes a screenshot (`Ctrl+Alt+S` also works from anywhere); the bottom button opens the folder.
+- **Settings**: three columns: tabs and extras, appearance (theme, style, font, accent) and behavior/weather. Drag the island to move it; *Restablecer* puts it back.
 
 Configuration is stored in `%APPDATA%\DynamicIsland\config.ini`.
 Tasks are stored in `%APPDATA%\DynamicIsland\todo.txt`. The last book and reading position are stored in `%APPDATA%\DynamicIsland\book.ini`.
 
-### Screenshots and recordings
+### Screenshots
 
 - Screenshots: `%USERPROFILE%\Pictures\DynamicIsland\Captura_YYYY-MM-DD_HH-MM-SS.png`
-- Recordings: `%USERPROFILE%\Videos\DynamicIsland\Grabacion_YYYY-MM-DD_HH-MM-SS.mp4`
 
-Both folders can also be opened from the tray menu.
+The folder can also be opened from the tray menu.
 
 ### Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Alt+S` | Take a screenshot |
-| `Ctrl+Alt+R` | Start/stop screen recording |
 
 ## Download
 
@@ -80,14 +95,11 @@ The executable is placed at `target\release\dynamic_island.exe`. To exit, right-
 - Media information and controls use the Windows media transport controls (WinRT).
 - Weather uses native WinHTTP with TLS 1.2/1.3 and Open-Meteo.
 - Screenshots use GDI `BitBlt` and the Windows Imaging Component (WIC) PNG encoder.
-- Recording uses GDI capture and Media Foundation (`IMFSinkWriter`) with the H.264 encoder.
-- No third-party capture or recording tools are used.
+- No third-party capture tools are used.
 
 ## Limitations
 
-- Recording captures the **primary monitor only** and does not record audio.
 - Screenshots capture the full virtual desktop (all monitors).
-- Recording requires an available H.264 encoder (included with Windows 10/11).
 - Weather requires an internet connection; IP-based location is approximate.
 - The UI is designed for the top edge of the primary monitor.
 - The EPUB reader shows plain text only (no images, fonts or CSS), skips DRM-protected books, and splits pages for the island's current font and scale.

@@ -19,7 +19,6 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
-    "Win32_Media_MediaFoundation",
     "Win32_Networking_WinHttp",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",

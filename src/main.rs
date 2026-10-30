@@ -48,7 +48,7 @@ use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTimeAsFil
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
+    keybd_event, GetAsyncKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
     UnregisterHotKey, HOT_KEY_MODIFIERS, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL,
     MOD_NOREPEAT, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -65,6 +65,7 @@ const CW: f32 = 700.0; // lienzo (logico)
 const CH: f32 = 430.0;
 const TOP: f32 = 8.0; // separacion con el borde superior (estilo isla)
 const EW: f32 = 440.0; // ancho de la isla expandida
+const EW_SET: f32 = 660.0; // ancho de Ajustes (tres columnas)
 const EW_WIDE: f32 = 620.0; // ancho para las paginas horizontales (Tiempo y Reloj)
 const CS: usize = 96; // lado de la caratula decodificada
 
@@ -77,8 +78,6 @@ const WM_APP_DEVMENU: u32 = 0x8000 + 10;
 const WM_APP_BOOK: u32 = 0x8000 + 11;
 
 // Lector de EPUB: lineas por pagina, paso entre lineas y ancho del texto (logicos)
-const BOOK_LINES: usize = 7;
-const BOOK_PITCH: f32 = 20.0;
 const BOOK_W: f32 = 388.0;
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 const MA_NOACTIVATE_: isize = 3;
@@ -87,6 +86,7 @@ const MA_ACTIVATE_: isize = 1;
 const T_CLOCK: usize = 2;
 const T_VIS: usize = 3;
 const T_PROX: usize = 4;
+const T_PICK: usize = 6;
 const DODGE_PX: f32 = 54.0; // cuanto baja la isla al esquivar las pestañas
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -256,12 +256,11 @@ const F_LYRMODE: usize = 17;
 const F_WEATHER: usize = 18;
 const F_SYSTEM: usize = 19;
 const F_CAPTURE: usize = 20;
-const F_REC_HIDE: usize = 21;
-const F_DODGE: usize = 22;
-const F_MIXER: usize = 23;
-const F_BOOK: usize = 24;
-const F_DISCORD: usize = 25;
-const F_COUNT: usize = 26;
+const F_DODGE: usize = 21;
+const F_MIXER: usize = 22;
+const F_BOOK: usize = 23;
+const F_COLOR: usize = 24;
+const F_COUNT: usize = 25;
 
 // Pomodoro: enfoque 25 min, descanso corto 5 min y descanso largo 15 min cada 4 rondas.
 const POMO_WORK: u64 = 25 * 60;
@@ -278,30 +277,23 @@ const FEATURES: [(&str, &str); F_COUNT] = [
     ("stopwatch", "Cronómetro"),
     ("calculator", "Calculadora"),
     ("battery", "Aviso de batería"),
-    ("fullscreen", "Ocultar en pantalla completa"),
+    ("fullscreen", "Ocultar en fullscreen"),
     ("volume", "Volumen con la rueda"),
     ("shadow", "Sombra"),
     ("lyrics", "Letras"),
     ("calendar", "Calendario"),
     ("todo", "Tareas"),
-    ("notif", "Botón de notificaciones"),
+    ("notif", "Notificaciones"),
     ("proximity", "Opacidad por proximidad"),
     ("drag", "Mover libremente"),
     ("lyricmode", "Letra en la isla"),
     ("weather", "Clima"),
     ("system", "Sistema"),
-    ("capture", "Captura y grabación"),
-    ("rechide", "Ocultar al grabar"),
-    ("dodge", "Esquivar pestañas del navegador"),
+    ("capture", "Captura de pantalla"),
+    ("dodge", "Esquivar pestañas web"),
     ("mixer", "Mezclador de volumen"),
     ("book", "Lector de EPUB"),
-    ("discord", "Discord"),
-];
-
-// que funciones salen en la pestaña "Funciones" de Ajustes
-const FUNC_LIST: [usize; 17] = [
-    F_MUSIC, F_LYRICS, F_LYRMODE, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_NOTIF,
-    F_BATT, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER, F_BOOK, F_DISCORD,
+    ("color", "Selector de color"),
 ];
 
 fn pomo_dur(phase: u8) -> u64 {
@@ -337,6 +329,7 @@ struct Cfg {
     lyrics_open: bool,
     source: String,
     accent: u8, // 0 = el del tema
+    book_fs: u8, // tamano de letra del lector: 0 pequeno, 1 normal, 2 grande
 }
 
 impl Default for Cfg {
@@ -356,6 +349,7 @@ impl Default for Cfg {
             lyrics_open: false,
             source: String::new(),
             accent: 0,
+            book_fs: 1,
         }
     }
 }
@@ -450,7 +444,7 @@ enum Page {
     Calc,
     Todo,
     Book,
-    Discord,
+    Color,
     System,
     Capture,
     Settings,
@@ -472,10 +466,6 @@ enum Act {
     Notif,
     Lyrics,
     Like,
-    DcMute,
-    DcDeaf,
-    DcFocus,
-    DcLeave,
     Prev,
     Toggle,
     Next,
@@ -496,7 +486,6 @@ enum Act {
     Autostart,
     Cycle(u8, i8),
     Slider(u8),
-    SubTab(u8),
     CalPrev,
     CalNext,
     CalToday,
@@ -509,9 +498,7 @@ enum Act {
     WeatherRefresh,
     WeatherLocate,
     Shot,
-    RecToggle,
     OpenShots,
-    OpenVideos,
     MixMute(usize),
     MixDevice(usize),
     Source,
@@ -521,6 +508,12 @@ enum Act {
     BookNext,
     BookChPrev,
     BookChNext,
+    BookToc,
+    PickColor,
+    CopyColor,
+    HistColor(usize),
+    BookAa,
+    BookGoto(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -537,7 +530,8 @@ enum WKind {
     Chip,
     Lyric,
     Heart,
-    Dc(u8),
+    Card,
+    Header,
     Mute,
     Source,
     Selector,
@@ -660,7 +654,6 @@ struct App {
     low_warned: bool,
     features: [bool; F_COUNT],
     autostart: bool,
-    settings_tab: u8,
     time_tab: u8,
     pomo_phase: u8,
     pomo_round: u32,
@@ -691,13 +684,10 @@ struct App {
     sys_sampler: system::Sampler,
     sys_cpu_hist: Vec<f32>,
     sys_ram_hist: Vec<f32>,
-    recorder: Option<capture::Recorder>,
     mixer: Option<mixer::Mixer>,
     mix_override: f32, // valor mostrado mientras se arrastra un deslizador del mezclador
     mix_last: f32,
-    rec_hidden: bool,
     last_shot: String,
-    last_video: String,
     slider_drag: Option<u8>,
     drag: Option<DragState>,
     prev_fg: isize,
@@ -708,9 +698,13 @@ struct App {
     book_pos: (usize, usize, usize),    // capitulo, parrafo, byte: inicio de la pagina actual
     book_pages: Vec<Vec<epub::Line>>,   // paginas del capitulo actual
     book_page: usize,
-    dc_mute: bool,
-    dc_deaf: bool,
-    book_pk: (usize, u8, u8, u32),      // (capitulo, fuente, tema, escala) de la paginacion
+    book_pk: (usize, u8, u8, u32, u8),  // (capitulo, fuente, tema, escala, tamano) de la paginacion
+    pick: u8, // 0 no, 1 esperando a soltar el boton, 2 activo
+    cur_color: u32,
+    colors: Vec<u32>,
+    book_toc: bool,                     // lista de capitulos abierta
+    book_toc_scroll: usize,
+    font_book: HFONT,
     tab_x: f32,                         // x de la pastilla de la pestaña activa (animada); <0 = sin posicion
     last_media: Media,                  // ultimo estado de reproduccion (para animar el cambio de cancion)
     prev_media: Option<Media>,          // la cancion anterior mientras se desvanece
@@ -770,6 +764,7 @@ fn load_config() -> ([bool; F_COUNT], Cfg) {
                         "wx_unit" => cfg.wx_unit = v.parse::<u8>().unwrap_or(0).min(1),
                         "lyrics_open" => cfg.lyrics_open = v != "0",
                         "source" => cfg.source = v.to_string(),
+                        "book_size" => cfg.book_fs = v.parse::<u8>().unwrap_or(1).min(2),
                         "accent" => cfg.accent = v.parse::<u8>().unwrap_or(0).min(ACCENT_NAMES.len() as u8 - 1),
                         _ => {}
                     }
@@ -800,7 +795,7 @@ fn save_config(f: &[bool; F_COUNT], cfg: &Cfg) {
             if cfg.lyrics_open { 1 } else { 0 }
         ));
         s.push_str(&format!("source={}\n", cfg.source.replace(['\n', '\r'], " ").trim()));
-        s.push_str(&format!("accent={}\n", cfg.accent));
+        s.push_str(&format!("accent={}\nbook_size={}\n", cfg.accent, cfg.book_fs));
         let _ = std::fs::write(d.join("config.ini"), s);
     }
 }
@@ -852,6 +847,19 @@ fn save_book_state(path: &str, pos: (usize, usize, usize)) {
         let s = format!("path={}\nchapter={}\npara={}\noff={}\n", path.replace(['\n', '\r'], " "), pos.0, pos.1, pos.2);
         let _ = std::fs::write(d.join("book.ini"), s);
     }
+}
+
+/// Medidas del lector segun el tamano de letra: (alto de fuente, alto de linea, lineas por pagina).
+fn book_dims(fs: u8) -> (i32, f32, usize) {
+    match fs {
+        0 => (12, 18.0, 8),
+        2 => (15, 23.0, 6),
+        _ => (13, 20.0, 7),
+    }
+}
+
+fn book_dims_px(fs: u8) -> i32 {
+    book_dims(fs).0
 }
 
 /// Ancho en pixeles de `s` con la fuente `font` (para partir lineas).
@@ -915,6 +923,72 @@ fn start_book_load(hwnd: isize, path: Option<String>) {
             None => BOOK_BUSY.store(false, Ordering::Release),
         }
     });
+}
+
+// ------------------------------------------------------------ buscador y color
+
+fn load_colors() -> Vec<u32> {
+    let mut v = Vec::new();
+    if let Some(d) = data_dir() {
+        if let Ok(txt) = std::fs::read_to_string(d.join("colors.txt")) {
+            for line in txt.lines() {
+                if let Ok(c) = u32::from_str_radix(line.trim(), 16) {
+                    if c <= 0xFFFFFF && v.len() < 12 {
+                        v.push(c);
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+fn save_colors(v: &[u32]) {
+    if let Some(d) = data_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let s: String = v.iter().map(|c| format!("{:06X}\n", c)).collect();
+        let _ = std::fs::write(d.join("colors.txt"), s);
+    }
+}
+
+fn color_hex(c: u32) -> String {
+    format!("#{:06X}", c & 0xFFFFFF)
+}
+
+fn color_f(c: u32) -> Rgb {
+    (((c >> 16) & 255) as f32, ((c >> 8) & 255) as f32, (c & 255) as f32)
+}
+
+/// Copia texto al portapapeles (con clip.exe, sin ventana).
+fn clip_copy(text: &str) {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        if let Ok(mut ch) = std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .creation_flags(0x0800_0000)
+            .spawn()
+        {
+            if let Some(mut si) = ch.stdin.take() {
+                let _ = si.write_all(text.as_bytes());
+            }
+            let _ = ch.wait();
+        }
+    });
+}
+
+/// Color (0xRRGGBB) del pixel de la pantalla en (x, y).
+fn screen_pixel(x: i32, y: i32) -> Option<u32> {
+    unsafe {
+        let dc = GetDC(None);
+        let c = GetPixel(dc, x, y).0;
+        ReleaseDC(None, dc);
+        if c == 0xFFFF_FFFF {
+            return None;
+        }
+        Some(((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
+    }
 }
 
 fn save_todos(t: &[(bool, String)]) {
@@ -1588,28 +1662,6 @@ fn spotify_like() {
     app_shortcut("spotify.exe", &[0x12, 0x10, 0x42]);
 }
 
-/// Discord: atajos globales por defecto (Ctrl+Shift+M mutear, Ctrl+Shift+D ensordecer);
-/// funcionan con Discord en segundo plano, sin cambiar de ventana.
-fn discord_keys(letter: u8) {
-    std::thread::spawn(move || unsafe {
-        for vk in [0x11u8, 0x10, letter] {
-            keybd_event(vk, 0, KEYBD_EVENT_FLAGS(0), 0);
-        }
-        for vk in [letter, 0x10u8, 0x11] {
-            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
-        }
-    });
-}
-
-fn discord_focus() {
-    let h = find_exe_window("discord.exe");
-    if h != 0 {
-        unsafe {
-            let _ = SetForegroundWindow(HWND(h as _));
-        }
-    }
-}
-
 fn key_tap(vk: u8, times: i32) {
     unsafe {
         for _ in 0..times {
@@ -1998,15 +2050,30 @@ impl<'a> Canvas<'a> {
         self.poly(&[(x1 + nx, y1 + ny), (x2 + nx, y2 + ny), (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)], col, f);
     }
 
+    /// Arco grueso con extremos redondos (angulos en radianes, 0 = derecha, sentido horario).
     fn arc(&mut self, cx: f32, cy: f32, r: f32, a0: f32, a1: f32, t: f32, col: Rgb, f: f32) {
-        let n = 12;
+        let sweep = (a1 - a0).abs();
+        let n = ((sweep / (2.0 * std::f32::consts::PI) * 80.0).ceil() as usize).max(2);
         let mut p = (cx + r * a0.cos(), cy + r * a0.sin());
         for k in 1..=n {
             let a = a0 + (a1 - a0) * k as f32 / n as f32;
             let q = (cx + r * a.cos(), cy + r * a.sin());
             self.line(p.0, p.1, q.0, q.1, t, col, f);
-            self.circle(q.0, q.1, t / 2.0, col, f);
             p = q;
+        }
+        if sweep < 6.2 {
+            self.circle(cx + r * a0.cos(), cy + r * a0.sin(), t / 2.0, col, f);
+            self.circle(p.0, p.1, t / 2.0, col, f);
+        }
+    }
+
+    /// Anillo de progreso estilo Apple (0..1 desde las 12 en punto).
+    fn gauge(&mut self, cx: f32, cy: f32, r: f32, t: f32, frac: f32, col: Rgb, track: Rgb, f: f32) {
+        let pi = std::f32::consts::PI;
+        self.arc(cx, cy, r, -pi / 2.0, 1.5 * pi, t, track, f);
+        let p = frac.clamp(0.0, 1.0);
+        if p > 0.004 {
+            self.arc(cx, cy, r, -pi / 2.0, -pi / 2.0 + 2.0 * pi * p, t, col, f);
         }
     }
 
@@ -2209,11 +2276,10 @@ impl<'a> Canvas<'a> {
                 }
             }
             Page::Mixer => self.speaker(cx, cy, s, col, false, f),
-            Page::Discord => {
-                self.rrect(cx - 7.5 * s, cy - 5.5 * s, 15.0 * s, 10.5 * s, 4.5 * s, col, f);
-                self.rrect(cx - 4.0 * s, cy + 3.0 * s, 4.0 * s, 4.0 * s, 1.5 * s, col, f);
-                self.circle(cx - 2.8 * s, cy - 0.5 * s, 1.5 * s, bg, f);
-                self.circle(cx + 2.8 * s, cy - 0.5 * s, 1.5 * s, bg, f);
+            Page::Color => {
+                self.line(cx - 6.0 * s, cy + 6.0 * s, cx + 1.5 * s, cy - 1.5 * s, 2.6 * s, col, f);
+                self.circle(cx + 4.0 * s, cy - 4.0 * s, 3.6 * s, col, f);
+                self.circle(cx - 6.5 * s, cy + 6.5 * s, 1.6 * s, col, f);
             }
             Page::Capture => {
                 self.rrect(cx - 7.0 * s, cy - 4.0 * s, 14.0 * s, 10.0 * s, 2.2 * s, col, f);
@@ -2273,6 +2339,14 @@ impl App {
         }
     }
 
+    /// Rectangulo de la tarjeta `i` (0..3) de la pagina Sistema (cuadricula 2x2).
+    fn sys_tile(&self, cxm: f32, y0: f32, i: usize) -> (f32, f32, f32, f32) {
+        let s = self.s;
+        let (tw, th) = (191.0 * s, 88.0 * s);
+        let (col, row) = ((i % 2) as f32, (i / 2) as f32);
+        (cxm - 196.0 * s + col * (tw + 10.0 * s), y0 + 38.0 * s + row * (th + 8.0 * s), tw, th)
+    }
+
     fn page_enabled(&self, p: Page) -> bool {
         match p {
             Page::Music => self.feat(F_MUSIC),
@@ -2283,9 +2357,9 @@ impl App {
             Page::Calc => self.feat(F_CALC),
             Page::Todo => self.feat(F_TODO),
             Page::Book => self.feat(F_BOOK),
-            Page::Discord => self.feat(F_DISCORD),
             Page::System => self.feat(F_SYSTEM),
             Page::Capture => self.feat(F_CAPTURE),
+            Page::Color => self.feat(F_COLOR),
             Page::Mixer => self.feat(F_MIXER),
             Page::Settings => true,
         }
@@ -2407,16 +2481,14 @@ impl App {
         }
     }
 
-    /// 0 temporizador, 1 cronometro, 2 musica, 3 reloj, 4 vacio, 5 letra, 6 clima, 7 grabando, 8 pomodoro
+    /// 0 temporizador, 1 cronometro, 2 musica, 3 reloj, 4 vacio, 5 letra, 6 clima, 8 pomodoro
     /// La cancion se muestra en la isla cerrada (el chip de fuente la puede dejar en "off").
     fn song_in_collapsed(&self) -> bool {
         self.cfg.source != "off"
     }
 
     fn collapsed_view(&self, m: &Media) -> u8 {
-        if self.recorder.is_some() {
-            7
-        } else if self.pomo_active() {
+        if self.pomo_active() {
             8
         } else if self.timer_active() {
             0
@@ -2495,27 +2567,22 @@ impl App {
                 Page::Calc => (EW, 304.0),
                 Page::Todo => (EW, 230.0),
                 Page::Book => (EW, 246.0),
-                Page::Discord => (EW, 152.0),
                 Page::Weather => (EW, 250.0),
-                Page::System => (EW, 240.0),
-                Page::Capture => (EW, 210.0),
+                Page::System => (EW, 252.0),
+                Page::Capture => (EW, 170.0),
+                Page::Color => (EW, 158.0),
                 Page::Mixer => {
                     let n = self.mixer.as_ref().map(|mx| mx.state().apps.len()).unwrap_or(0).clamp(1, 6) as f32;
                     (EW, 88.0 + n * 30.0)
                 }
-                Page::Settings => match self.settings_tab {
-                    0 => (EW, 368.0),
-                    1 => (EW, 308.0),
-                    2 => (EW, 362.0),
-                    _ => (EW, 188.0),
-                },
+                Page::Settings => (EW_SET, 396.0),
             },
             Mode::Collapsed => match self.collapsed_view(m) {
                 0 | 1 => (132.0, 34.0),
                 2 => (226.0, 34.0),
                 5 => (320.0, 34.0),
                 3 => (120.0, 34.0),
-                6 | 7 | 8 => (132.0, 34.0),
+                6 | 8 => (132.0, 34.0),
                 _ => (96.0, 30.0),
             },
         }
@@ -2544,7 +2611,7 @@ impl App {
         self.ensure_time_tab();
         let new = if self.toast.is_some() {
             Mode::Toast
-        } else if self.hover || self.pinned || self.editing {
+        } else if self.hover || self.pinned || self.editing || self.pick != 0 {
             Mode::Expanded
         } else {
             Mode::Collapsed
@@ -2891,7 +2958,7 @@ impl App {
             let dx = (l - px).max(px - (l + w)).max(0.0);
             let dy = (t - py).max(py - (t + h)).max(0.0);
             let dist = (dx * dx + dy * dy).sqrt();
-            let near = self.hover || self.pinned || self.editing || self.toast.is_some() || self.drag.is_some();
+            let near = self.hover || self.pinned || self.editing || self.pick != 0 || self.toast.is_some() || self.drag.is_some();
             if near {
                 1.0
             } else {
@@ -2909,7 +2976,7 @@ impl App {
         let fs = self.feat(F_FULLSCREEN) && is_fullscreen();
         if fs != self.hidden {
             self.hidden = fs;
-            let show = !fs && !self.rec_hidden;
+            let show = !fs;
             unsafe {
                 let _ = ShowWindow(self.hwnd, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
             }
@@ -3035,17 +3102,6 @@ impl App {
             redraw = true;
         }
 
-        // grabación en curso
-        if let Some(e) = self.recorder.as_ref().and_then(|r| r.error()) {
-            self.show_toast(false, format!("Grabación detenida: {e}"), 6);
-            self.stop_recording();
-            redraw = true;
-        } else if self.recorder.is_some()
-            && (self.mode == Mode::Collapsed || (self.mode == Mode::Expanded && self.page == Page::Capture))
-        {
-            redraw = true;
-        }
-
         // clima cada 15 minutos mientras se esté mostrando
         if self.feat(F_WEATHER) {
             let stale = self.wx_at.map(|t| t.elapsed() > Duration::from_secs(900)).unwrap_or(true);
@@ -3061,6 +3117,64 @@ impl App {
     }
 
     // ---- edicion de texto (tareas / calculadora)
+
+    fn pick_start(&mut self) {
+        self.pick = 1;
+        unsafe {
+            SetTimer(self.hwnd, T_PICK, 25, None);
+        }
+    }
+
+    fn pick_stop(&mut self) {
+        if self.pick != 0 {
+            self.pick = 0;
+            unsafe {
+                let _ = KillTimer(self.hwnd, T_PICK);
+            }
+        }
+    }
+
+    fn add_color(&mut self, c: u32) {
+        self.colors.retain(|&x| x != c);
+        self.colors.insert(0, c);
+        self.colors.truncate(12);
+        self.cur_color = c;
+        save_colors(&self.colors);
+    }
+
+    /// Cuentagotas: sigue al cursor y fija el color con clic o Enter (Esc cancela).
+    fn pick_tick(&mut self) {
+        if self.pick == 0 {
+            return;
+        }
+        let key = |vk: i32| unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 };
+        let down = key(0x01);
+        if self.pick == 1 {
+            if !down {
+                self.pick = 2;
+            }
+            return;
+        }
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        if let Some(c) = screen_pixel(p.x, p.y) {
+            self.cur_color = c;
+        }
+        if key(0x1B) {
+            self.pick_stop();
+        } else if down || key(0x0D) {
+            let c = self.cur_color;
+            self.add_color(c);
+            clip_copy(&color_hex(c));
+            self.pick_stop();
+            self.show_toast(false, format!("{} copiado", color_hex(c)), 2);
+        }
+        if !self.animating {
+            self.render();
+        }
+    }
 
     fn begin_edit(&mut self) {
         if self.editing {
@@ -3174,7 +3288,7 @@ impl App {
         }
         self.hover = h;
         if h {
-            if !self.pinned && !self.editing && self.collapsed_at.elapsed() > Duration::from_secs(8) {
+            if !self.pinned && !self.editing && self.pick == 0 && self.collapsed_at.elapsed() > Duration::from_secs(8) {
                 let m = self.media.lock().unwrap().clone();
                 self.page = self.home_page(&m);
             }
@@ -3362,6 +3476,18 @@ impl App {
 
     fn on_wheel(&mut self, delta: i32) {
         if self.mode == Mode::Expanded && self.page == Page::Book && self.book.is_some() {
+            if self.book_toc {
+                let n = self.book.as_ref().map(|b| b.chapters.len()).unwrap_or(0);
+                if delta > 0 {
+                    self.book_toc_scroll = self.book_toc_scroll.saturating_sub(1);
+                } else {
+                    self.book_toc_scroll = (self.book_toc_scroll + 1).min(n.saturating_sub(7));
+                }
+                if !self.animating {
+                    self.render();
+                }
+                return;
+            }
             if delta != 0 {
                 self.book_turn(if delta > 0 { -1 } else { 1 });
                 if !self.animating {
@@ -3390,7 +3516,7 @@ impl App {
 
     fn rebuild_fonts(&mut self) {
         unsafe {
-            for f in [self.font_main, self.font_small, self.font_big, self.font_strike] {
+            for f in [self.font_main, self.font_small, self.font_big, self.font_strike, self.font_book] {
                 let _ = DeleteObject(HGDIOBJ(f.0));
             }
         }
@@ -3400,6 +3526,7 @@ impl App {
         self.font_small = make_font(face, (13.0 * s) as i32, 400, false);
         self.font_big = make_font(face, (30.0 * s) as i32, 300, false);
         self.font_strike = make_font(face, (13.0 * s) as i32, 400, true);
+        self.font_book = make_font(face, (book_dims_px(self.cfg.book_fs) as f32 * s) as i32, 400, false);
     }
 
     // ---- lector de EPUB
@@ -3412,16 +3539,17 @@ impl App {
         };
         let ch = self.book_pos.0.min(nch - 1);
         self.book_pos.0 = ch;
-        let key = (ch, self.cfg.font, self.cfg.theme, self.s.to_bits());
+        let key = (ch, self.cfg.font, self.cfg.theme, self.s.to_bits(), self.cfg.book_fs);
         if key == self.book_pk && !self.book_pages.is_empty() {
             return;
         }
-        let (mem, fm, fs) = (self.mem, self.font_main, self.font_small);
+        let (mem, fm, fs) = (self.mem, self.font_main, self.font_book);
+        let lines = book_dims(self.cfg.book_fs).2;
         let width = (BOOK_W * self.s) as i32;
         let pages = {
             let Some(book) = &self.book else { return };
             let mut measure = |t: &str, heading: bool| -> i32 { unsafe { text_width(mem, if heading { fm } else { fs }, t) } };
-            epub::paginate(&book.chapters[ch].paras, width, BOOK_LINES, &mut measure)
+            epub::paginate(&book.chapters[ch].paras, width, lines, &mut measure)
         };
         self.book_page = epub::page_for(&pages, (self.book_pos.1, self.book_pos.2));
         self.book_pages = pages;
@@ -3495,7 +3623,9 @@ impl App {
                 self.book_state = 2;
                 self.book_err.clear();
                 self.book_pages.clear();
-                self.book_pk = (usize::MAX, 0, 0, 0);
+                self.book_pk = (usize::MAX, 0, 0, 0, 0);
+                self.book_toc = false;
+                self.book_toc_scroll = 0;
                 self.book_ensure_pages();
             }
             Err(e) => {
@@ -3680,7 +3810,7 @@ impl App {
         }
         std::thread::sleep(Duration::from_millis(140));
         let shot = capture::grab(x, y, w, h);
-        if !self.hidden && !self.rec_hidden {
+        if !self.hidden {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
@@ -3702,68 +3832,6 @@ impl App {
         self.changed();
     }
 
-    fn toggle_recording(&mut self) {
-        if self.recorder.is_some() {
-            self.stop_recording();
-            return;
-        }
-        if !self.feat(F_CAPTURE) {
-            return;
-        }
-        let path = match capture::new_video_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.show_toast(false, format!("Error: {e}"), 6);
-                return;
-            }
-        };
-        match capture::Recorder::start(path, 30) {
-            Ok(r) => {
-                self.recorder = Some(r);
-                self.last_video.clear();
-                if self.feat(F_REC_HIDE) {
-                    unsafe {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
-                    }
-                    self.rec_hidden = true;
-                }
-                unsafe {
-                    let _ = MessageBeep(MB_OK);
-                }
-                set_tray_tip(self.hwnd, "Dynamic Island · Grabando");
-                if !self.rec_hidden {
-                    self.changed();
-                }
-            }
-            Err(e) => self.show_toast(false, format!("No se pudo grabar: {e}"), 6),
-        }
-    }
-
-    fn stop_recording(&mut self) {
-        let Some(r) = self.recorder.take() else { return };
-        let res = r.stop();
-        if self.rec_hidden {
-            self.rec_hidden = false;
-            if !self.hidden {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                }
-            }
-        }
-        set_tray_tip(self.hwnd, "Dynamic Island");
-        match res {
-            Ok(p) => {
-                self.last_video = p.display().to_string();
-                unsafe {
-                    let _ = MessageBeep(MB_OK);
-                }
-                self.show_toast(false, "Grabación guardada".into(), 4);
-            }
-            Err(e) => self.show_toast(false, format!("Error al grabar: {e}"), 6),
-        }
-        self.changed();
-    }
-
     fn do_act(&mut self, act: Act) {
         let now = Instant::now();
         match act {
@@ -3772,6 +3840,7 @@ impl App {
                 if self.editing {
                     self.end_edit(true);
                 }
+                self.pick_stop();
                 self.page = p;
                 if p == Page::Weather || p == Page::Clock {
                     self.ensure_weather();
@@ -3797,20 +3866,6 @@ impl App {
             }
             Act::Notif => open_notif(),
             Act::Like => spotify_like(),
-            Act::DcMute => {
-                self.dc_mute = !self.dc_mute;
-                discord_keys(0x4D);
-            }
-            Act::DcDeaf => {
-                self.dc_deaf = !self.dc_deaf;
-                discord_keys(0x44);
-            }
-            Act::DcFocus => discord_focus(),
-            Act::DcLeave => {
-                self.dc_mute = false;
-                self.dc_deaf = false;
-                discord_keys(0x58);
-            }
             Act::Lyrics => {
                 self.cfg.lyrics_open = !self.cfg.lyrics_open;
                 save_config(&self.features, &self.cfg);
@@ -3953,12 +4008,6 @@ impl App {
                 }
                 save_config(&self.features, &self.cfg);
             }
-            Act::SubTab(i) => {
-                if self.editing {
-                    self.end_edit(true);
-                }
-                self.settings_tab = i;
-            }
             Act::CalPrev => {
                 if self.cal_month == 1 {
                     self.cal_month = 12;
@@ -4010,12 +4059,7 @@ impl App {
                 self.take_shot();
                 return;
             }
-            Act::RecToggle => {
-                self.toggle_recording();
-                return;
-            }
             Act::OpenShots => open_folder(&capture::pictures_dir()),
-            Act::OpenVideos => open_folder(&capture::videos_dir()),
             Act::MixMute(i) => {
                 if let Some(mx) = &self.mixer {
                     let st = mx.state();
@@ -4070,6 +4114,48 @@ impl App {
             Act::BookNext => self.book_turn(1),
             Act::BookChPrev => self.book_chapter(-1),
             Act::BookChNext => self.book_chapter(1),
+            Act::PickColor => {
+                if self.editing {
+                    self.end_edit(false);
+                }
+                if self.pick != 0 {
+                    self.pick_stop();
+                } else {
+                    self.pick_start();
+                }
+            }
+            Act::CopyColor => {
+                clip_copy(&color_hex(self.cur_color));
+                self.show_toast(false, format!("{} copiado", color_hex(self.cur_color)), 2);
+            }
+            Act::HistColor(i) => {
+                if let Some(&c) = self.colors.get(i) {
+                    self.cur_color = c;
+                    clip_copy(&color_hex(c));
+                    self.show_toast(false, format!("{} copiado", color_hex(c)), 2);
+                }
+            }
+            Act::BookToc => {
+                self.book_toc = !self.book_toc;
+                if self.book_toc {
+                    let rows = 7usize;
+                    let ch = self.book_pos.0;
+                    self.book_toc_scroll = ch.saturating_sub(rows / 2);
+                }
+            }
+            Act::BookAa => {
+                self.cfg.book_fs = (self.cfg.book_fs + 1) % 3;
+                save_config(&self.features, &self.cfg);
+                self.rebuild_fonts();
+                self.book_pk = (usize::MAX, 0, 0, 0, 0);
+                self.book_ensure_pages();
+            }
+            Act::BookGoto(i) => {
+                self.book_toc = false;
+                self.book_pos = (i, 0, 0);
+                self.book_pk = (usize::MAX, 0, 0, 0, 0);
+                self.book_ensure_pages();
+            }
         }
         self.changed();
     }
@@ -4154,9 +4240,6 @@ impl App {
                     }
                 } else {
                     unregister_hotkeys(self.hwnd);
-                    if self.recorder.is_some() {
-                        self.stop_recording();
-                    }
                 }
             }
             _ => {}
@@ -4188,11 +4271,7 @@ impl App {
             160 => {
                 self.take_shot();
             }
-            161 => {
-                self.toggle_recording();
-            }
             162 => open_folder(&capture::pictures_dir()),
-            163 => open_folder(&capture::videos_dir()),
             200..=299 => {
                 let i = (id - 200) as usize;
                 if i < F_COUNT {
@@ -4311,7 +4390,7 @@ impl App {
                 self.calc_press(k);
             }
             Page::Settings => {
-                if self.settings_tab != 3 || !self.editing {
+                if !self.editing {
                     return;
                 }
                 match ch {
@@ -4368,16 +4447,16 @@ impl App {
             (Page::Calc, "Calc", 32.0),
             (Page::Todo, "Tareas", 44.0),
             (Page::Book, "Libro", 36.0),
-            (Page::Discord, "Discord", 50.0),
+            (Page::Color, "Color", 40.0),
             (Page::System, "Sistema", 46.0),
             (Page::Capture, "Captura", 50.0),
             (Page::Settings, "Ajustes", 48.0),
         ];
-        const TAB_W: f32 = 23.0;
-        const TAB_GAP: f32 = 1.5;
+        const TAB_W: f32 = 22.0;
+        const TAB_GAP: f32 = 1.0;
         let centered = self.th.tabs_center;
         // estilo centrado: todas las pestañas iguales (solo iconos), el grupo queda en el centro
-        const CT_W: f32 = 26.0;
+        const CT_W: f32 = 24.0;
         const CT_GAP: f32 = 1.0;
         let n_tabs = TABS.iter().filter(|t| self.page_enabled(t.0)).count() as f32;
         let mut x = if centered {
@@ -4514,28 +4593,34 @@ impl App {
                     v.push(Widget::new(cx + 168.0 * s, y, 28.0 * s, 26.0 * s, WKind::Del, Act::TodoDel(i), ""));
                 }
             }
-            Page::Discord => {
-                let (m_lbl, d_lbl) = (
-                    if self.dc_mute { "Silenciado" } else { "Mutear" },
-                    if self.dc_deaf { "Ensordecido" } else { "Ensordecer" },
-                );
-                let cw = 92.0 * s;
-                let x0 = cx - 196.0 * s;
-                let (cy0, ch) = (y0 + 40.0 * s, 66.0 * s);
-                v.push(Widget::new(x0, cy0, cw, ch, WKind::Dc(0), Act::DcMute, m_lbl).on(self.dc_mute));
-                v.push(Widget::new(x0 + (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(1), Act::DcDeaf, d_lbl).on(self.dc_deaf));
-                v.push(Widget::new(x0 + 2.0 * (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(2), Act::DcLeave, "Desconectar"));
-                v.push(Widget::new(x0 + 3.0 * (cw + 8.0 * s), cy0, cw, ch, WKind::Dc(3), Act::DcFocus, "Abrir"));
-            }
             Page::Book => {
-                v.push(Widget::new(cx - 196.0 * s, y0 + 37.0 * s, 64.0 * s, 22.0 * s, WKind::Pill, Act::BookOpen, "Abrir…"));
+                if self.book.is_none() {
+                    v.push(Widget::new(cx - 196.0 * s, y0 + 37.0 * s, 62.0 * s, 22.0 * s, WKind::Chip, Act::BookOpen, "Abrir…"));
+                } else {
+                    v.push(Widget::new(cx - 196.0 * s, y0 + 37.0 * s, 32.0 * s, 22.0 * s, WKind::Chip, Act::BookAa, "Aa"));
+                    // el titulo es un boton (por ahora abre el selector; luego sera la biblioteca)
+                    v.push(Widget::new(cx - 100.0 * s, y0 + 37.0 * s, 200.0 * s, 22.0 * s, WKind::Chip, Act::BookOpen, ""));
+                }
                 let ty = y0 + 62.0 * s;
-                let th_ = BOOK_PITCH * BOOK_LINES as f32 * s;
+                let (_, pitch, lines) = book_dims(self.cfg.book_fs);
+                let th_ = pitch * lines as f32 * s;
                 if self.book.is_some() {
-                    // zonas de toque: izquierda = pagina anterior, resto = siguiente
-                    v.push(Widget::new(cx - 196.0 * s, ty, 130.0 * s, th_, WKind::Label, Act::BookPrev, ""));
-                    v.push(Widget::new(cx - 66.0 * s, ty, 262.0 * s, th_, WKind::Label, Act::BookNext, ""));
+                    if self.book_toc {
+                        let n = self.book.as_ref().map(|b| b.chapters.len()).unwrap_or(0);
+                        for k in 0..7usize {
+                            let i = self.book_toc_scroll + k;
+                            if i >= n {
+                                break;
+                            }
+                            v.push(Widget::new(cx - 196.0 * s, ty + k as f32 * 20.0 * s, 392.0 * s, 20.0 * s, WKind::Label, Act::BookGoto(i), ""));
+                        }
+                    } else {
+                        // zonas de toque: izquierda = pagina anterior, resto = siguiente
+                        v.push(Widget::new(cx - 196.0 * s, ty, 130.0 * s, th_, WKind::Label, Act::BookPrev, ""));
+                        v.push(Widget::new(cx - 66.0 * s, ty, 262.0 * s, th_, WKind::Label, Act::BookNext, ""));
+                    }
                     let fy = y0 + 210.0 * s;
+                    v.push(Widget::new(cx - 126.0 * s, fy, 252.0 * s, 24.0 * s, WKind::Chip, Act::BookToc, "").on(self.book_toc));
                     v.push(Widget::new(cx - 196.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookChPrev, "«"));
                     v.push(Widget::new(cx - 162.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookPrev, "‹"));
                     v.push(Widget::new(cx + 132.0 * s, fy, 30.0 * s, 24.0 * s, WKind::Pill, Act::BookNext, "›"));
@@ -4545,84 +4630,88 @@ impl App {
                 }
             }
             Page::Settings => {
-                let chips: [(&'static str, f32); 4] = [
-                    ("Funciones", 86.0),
-                    ("Apariencia", 86.0),
-                    ("Comportamiento", 112.0),
-                    ("Clima", 60.0),
-                ];
-                let total: f32 = chips.iter().map(|c| c.1).sum::<f32>() + 18.0;
-                let mut x = cx - total * s / 2.0;
-                for (i, (l, wd)) in chips.iter().enumerate() {
-                    v.push(Widget::new(x, y0 + 40.0 * s, wd * s, 22.0 * s, WKind::Chip, Act::SubTab(i as u8), *l).on(self.settings_tab == i as u8));
-                    x += (wd + 6.0) * s;
+                // tres columnas de tarjetas: Pestañas | Extras + Apariencia | Comportamiento + Clima
+                let (cw, gap, pad) = (206.0 * s, 8.0 * s, 10.0 * s);
+                let inner = cw - 2.0 * pad;
+                let rh = 22.0 * s;
+                let top = y0 + 38.0 * s;
+                let total_h = 346.0 * s;
+                let colx = |i: usize| cx - (3.0 * cw + 2.0 * gap) / 2.0 + i as f32 * (cw + gap);
+                let head = 26.0 * s;
+                let card = |v: &mut Vec<Widget>, col: usize, y: f32, h: f32, title: &'static str| {
+                    v.push(Widget::new(colx(col), y, cw, h, WKind::Card, Act::None, ""));
+                    v.push(Widget::new(colx(col) + pad, y + 4.0 * s, inner, 22.0 * s, WKind::Header, Act::None, title));
+                };
+                let toggle = |v: &mut Vec<Widget>, col: usize, y: f32, fi: usize| {
+                    v.push(Widget::new(colx(col) + pad, y, inner, rh, WKind::Toggle, Act::Feature(fi), FEATURES[fi].1).on(self.features[fi]));
+                };
+                let selector = |v: &mut Vec<Widget>, col: usize, y: f32, id: u8, name: &'static str, val: &'static str| {
+                    let x = colx(col) + pad;
+                    v.push(Widget::new(x, y, 46.0 * s, rh, WKind::Label, Act::None, name));
+                    v.push(Widget::new(x + 46.0 * s, y + 2.0 * s, 16.0 * s, rh - 4.0 * s, WKind::Arrow(-1), Act::Cycle(id, -1), ""));
+                    v.push(Widget::new(x + 62.0 * s, y, 108.0 * s, rh, WKind::Selector, Act::Cycle(id, 1), "").l2(val));
+                    v.push(Widget::new(x + 170.0 * s, y + 2.0 * s, 16.0 * s, rh - 4.0 * s, WKind::Arrow(1), Act::Cycle(id, 1), ""));
+                };
+                // columna 1: pestañas
+                card(&mut v, 0, top, total_h, "Pestañas");
+                for (k, fi) in [F_MUSIC, F_CLOCK, F_CALENDAR, F_TIMER, F_STOPWATCH, F_CALC, F_TODO, F_BOOK, F_COLOR, F_WEATHER, F_SYSTEM, F_CAPTURE, F_MIXER]
+                    .iter()
+                    .enumerate()
+                {
+                    toggle(&mut v, 0, top + head + k as f32 * rh, *fi);
                 }
-                let ry = y0 + 78.0 * s;
-                let (pitch, rh) = (30.0 * s, 26.0 * s);
-                let toggle = |v: &mut Vec<Widget>, row: f32, fi: usize| {
-                    v.push(Widget::new(cx - 200.0 * s, ry + row * pitch, 400.0 * s, rh, WKind::Toggle, Act::Feature(fi), FEATURES[fi].1).on(self.features[fi]));
-                };
-                let selector = |v: &mut Vec<Widget>, row: f32, id: u8, name: &'static str, val: &'static str| {
-                    let y = ry + row * pitch;
-                    v.push(Widget::new(cx - 200.0 * s, y, 180.0 * s, rh, WKind::Label, Act::None, name));
-                    v.push(Widget::new(cx - 10.0 * s, y + 2.0 * s, 22.0 * s, rh - 4.0 * s, WKind::Arrow(-1), Act::Cycle(id, -1), ""));
-                    v.push(Widget::new(cx + 14.0 * s, y, 158.0 * s, rh, WKind::Selector, Act::Cycle(id, 1), "").l2(val));
-                    v.push(Widget::new(cx + 174.0 * s, y + 2.0 * s, 22.0 * s, rh - 4.0 * s, WKind::Arrow(1), Act::Cycle(id, 1), ""));
-                };
-                match self.settings_tab {
-                    0 => {
-                        for (k, &fi) in FUNC_LIST.iter().enumerate() {
-                            let (col, row) = ((k % 2) as f32, (k / 2) as f32);
-                            v.push(
-                                Widget::new(cx - 208.0 * s + col * 212.0 * s, ry + row * pitch, 200.0 * s, rh, WKind::Toggle, Act::Feature(fi), FEATURES[fi].1)
-                                    .on(self.features[fi]),
-                            );
-                        }
-                    }
-                    1 => {
-                        const STYLES: [&str; 2] = ["Isla", "Notch"];
-                        selector(&mut v, 0.0, 0, "Tema", THEME_NAMES[self.cfg.theme as usize]);
-                        selector(&mut v, 1.0, 1, "Estilo", STYLES[self.cfg.style as usize]);
-                        selector(&mut v, 2.0, 2, "Fuente", FONTS[self.cfg.font as usize]);
-                        toggle(&mut v, 3.0, F_SHADOW);
-                        toggle(&mut v, 4.0, F_VIS);
-                        toggle(&mut v, 5.0, F_COVER);
-                        selector(&mut v, 6.0, 4, "Acento", ACCENT_NAMES[self.cfg.accent as usize]);
-                    }
-                    2 => {
-                        toggle(&mut v, 0.0, F_DRAG);
-                        let y1 = ry + pitch;
-                        v.push(Widget::new(cx - 200.0 * s, y1, 180.0 * s, rh, WKind::Label, Act::None, "Posición de la isla"));
-                        v.push(Widget::new(cx + 86.0 * s, y1 + 1.0 * s, 110.0 * s, rh - 2.0 * s, WKind::Pill, Act::ResetPos, "Restablecer"));
-                        toggle(&mut v, 2.0, F_PROX);
-                        let y3 = ry + 3.0 * pitch;
-                        v.push(Widget::new(cx - 200.0 * s, y3, 160.0 * s, rh, WKind::Label, Act::None, "Opacidad mínima"));
-                        v.push(Widget::new(cx - 30.0 * s, y3, 172.0 * s, rh, WKind::Slider, Act::Slider(0), "").val((self.cfg.op_min - 0.1) / 0.8));
-                        let y4 = ry + 4.0 * pitch;
-                        v.push(Widget::new(cx - 200.0 * s, y4, 160.0 * s, rh, WKind::Label, Act::None, "Distancia"));
-                        v.push(Widget::new(cx - 30.0 * s, y4, 172.0 * s, rh, WKind::Slider, Act::Slider(1), "").val((self.cfg.prox_dist - 100.0) / 500.0));
-                        toggle(&mut v, 5.0, F_FULLSCREEN);
-                        toggle(&mut v, 6.0, F_VOLUME);
-                        let y7 = ry + 7.0 * pitch;
-                        v.push(
-                            Widget::new(cx - 200.0 * s, y7, 400.0 * s, rh, WKind::Toggle, Act::Autostart, "Iniciar con Windows").on(self.autostart),
-                        );
-                        toggle(&mut v, 8.0, F_DODGE);
-                    }
-                    _ => {
-                        const UNITS: [&str; 2] = ["°C (métrico)", "°F (imperial)"];
-                        let y0r = ry;
-                        v.push(Widget::new(cx - 200.0 * s, y0r, 70.0 * s, rh, WKind::Label, Act::None, "Ciudad"));
-                        v.push(
-                            Widget::new(cx - 126.0 * s, y0r, 252.0 * s, rh, WKind::Input, Act::CityInput, "")
-                                .on(self.editing),
-                        );
-                        v.push(Widget::new(cx + 132.0 * s, y0r + 1.0 * s, 68.0 * s, rh - 2.0 * s, WKind::Pill, Act::CitySearch, "Buscar"));
-                        selector(&mut v, 1.0, 3, "Unidades", UNITS[self.cfg.wx_unit as usize]);
-                        let y2 = ry + 2.0 * pitch;
-                        v.push(Widget::new(cx - 200.0 * s, y2, 190.0 * s, rh, WKind::Pill, Act::WeatherLocate, "Detectar ubicación"));
-                        v.push(Widget::new(cx + 10.0 * s, y2, 190.0 * s, rh, WKind::Pill, Act::WeatherRefresh, "Actualizar ahora"));
-                    }
+                // columna 2: extras y apariencia
+                let h_ext = head + 4.0 * rh + 8.0 * s;
+                card(&mut v, 1, top, h_ext, "Extras");
+                for (k, fi) in [F_LYRICS, F_LYRMODE, F_NOTIF, F_BATT].iter().enumerate() {
+                    toggle(&mut v, 1, top + head + k as f32 * rh, *fi);
+                }
+                let ya = top + h_ext + 6.0 * s;
+                card(&mut v, 1, ya, total_h - h_ext - 6.0 * s, "Apariencia");
+                const STYLES: [&str; 2] = ["Isla", "Notch"];
+                let r0 = ya + head;
+                selector(&mut v, 1, r0, 0, "Tema", THEME_NAMES[self.cfg.theme as usize]);
+                selector(&mut v, 1, r0 + rh, 1, "Estilo", STYLES[self.cfg.style as usize]);
+                selector(&mut v, 1, r0 + 2.0 * rh, 2, "Fuente", FONTS[self.cfg.font as usize]);
+                selector(&mut v, 1, r0 + 3.0 * rh, 4, "Acento", ACCENT_NAMES[self.cfg.accent as usize]);
+                toggle(&mut v, 1, r0 + 4.0 * rh, F_SHADOW);
+                toggle(&mut v, 1, r0 + 5.0 * rh, F_VIS);
+                toggle(&mut v, 1, r0 + 6.0 * rh, F_COVER);
+                // columna 3: comportamiento y clima
+                let h_beh = head + 9.0 * rh + 8.0 * s;
+                card(&mut v, 2, top, h_beh, "Comportamiento");
+                let x3 = colx(2) + pad;
+                let r = top + head;
+                toggle(&mut v, 2, r, F_DRAG);
+                v.push(Widget::new(x3, r + rh, 80.0 * s, rh, WKind::Label, Act::None, "Posición"));
+                v.push(Widget::new(x3 + 86.0 * s, r + rh + 1.0 * s, 100.0 * s, rh - 2.0 * s, WKind::Pill, Act::ResetPos, "Restablecer"));
+                toggle(&mut v, 2, r + 2.0 * rh, F_PROX);
+                v.push(Widget::new(x3, r + 3.0 * rh, 84.0 * s, rh, WKind::Label, Act::None, "Opacidad mín."));
+                v.push(Widget::new(x3 + 84.0 * s, r + 3.0 * rh, 62.0 * s, rh, WKind::Slider, Act::Slider(0), "").val((self.cfg.op_min - 0.1) / 0.8));
+                v.push(Widget::new(x3, r + 4.0 * rh, 84.0 * s, rh, WKind::Label, Act::None, "Distancia"));
+                v.push(Widget::new(x3 + 84.0 * s, r + 4.0 * rh, 62.0 * s, rh, WKind::Slider, Act::Slider(1), "").val((self.cfg.prox_dist - 100.0) / 500.0));
+                toggle(&mut v, 2, r + 5.0 * rh, F_FULLSCREEN);
+                toggle(&mut v, 2, r + 6.0 * rh, F_VOLUME);
+                v.push(Widget::new(x3, r + 7.0 * rh, inner, rh, WKind::Toggle, Act::Autostart, "Iniciar con Windows").on(self.autostart));
+                toggle(&mut v, 2, r + 8.0 * rh, F_DODGE);
+                let yw = top + h_beh + 6.0 * s;
+                card(&mut v, 2, yw, total_h - h_beh - 6.0 * s, "Clima");
+                const UNITS: [&str; 2] = ["°C (métrico)", "°F (imperial)"];
+                let rw = yw + head;
+                v.push(Widget::new(x3, rw, 118.0 * s, rh, WKind::Input, Act::CityInput, "").on(self.editing));
+                v.push(Widget::new(x3 + 122.0 * s, rw + 1.0 * s, 64.0 * s, rh - 2.0 * s, WKind::Pill, Act::CitySearch, "Buscar"));
+                selector(&mut v, 2, rw + rh + 2.0 * s, 3, "Unid.", UNITS[self.cfg.wx_unit as usize]);
+                let yb = rw + 2.0 * rh + 4.0 * s;
+                v.push(Widget::new(x3, yb, 91.0 * s, rh - 2.0 * s, WKind::Pill, Act::WeatherLocate, "Ubicación"));
+                v.push(Widget::new(x3 + 95.0 * s, yb, 91.0 * s, rh - 2.0 * s, WKind::Pill, Act::WeatherRefresh, "Actualizar"));
+            }
+            Page::Color => {
+                let ix = cx - 196.0 * s;
+                let lbl = if self.pick != 0 { "Eligiendo…" } else { "Cuentagotas" };
+                v.push(Widget::new(cx + 14.0 * s, y0 + 44.0 * s, 108.0 * s, 26.0 * s, WKind::Pill, Act::PickColor, lbl).on(self.pick != 0));
+                v.push(Widget::new(cx + 128.0 * s, y0 + 44.0 * s, 68.0 * s, 26.0 * s, WKind::Pill, Act::CopyColor, "Copiar"));
+                for i in 0..self.colors.len().min(12) {
+                    v.push(Widget::new(ix + i as f32 * 31.0 * s, y0 + 118.0 * s, 26.0 * s, 26.0 * s, WKind::Label, Act::HistColor(i), ""));
                 }
             }
             Page::Weather | Page::System | Page::Clock => {}
@@ -4642,15 +4731,8 @@ impl App {
                 }
             }
             Page::Capture => {
-                v.push(Widget::new(cx - 196.0 * s, y0 + 42.0 * s, 186.0 * s, 32.0 * s, WKind::Pill, Act::Shot, "Captura de pantalla"));
-                let rec = if self.recorder.is_some() { "Detener" } else { "Grabar pantalla" };
-                v.push(Widget::new(cx + 10.0 * s, y0 + 42.0 * s, 186.0 * s, 32.0 * s, WKind::Pill, Act::RecToggle, rec));
-                v.push(Widget::new(cx - 196.0 * s, y0 + 128.0 * s, 180.0 * s, 24.0 * s, WKind::Pill, Act::OpenShots, "Abrir capturas"));
-                v.push(Widget::new(cx + 16.0 * s, y0 + 128.0 * s, 180.0 * s, 24.0 * s, WKind::Pill, Act::OpenVideos, "Abrir grabaciones"));
-                v.push(
-                    Widget::new(cx - 200.0 * s, y0 + 160.0 * s, 400.0 * s, 26.0 * s, WKind::Toggle, Act::Feature(F_REC_HIDE), FEATURES[F_REC_HIDE].1)
-                        .on(self.features[F_REC_HIDE]),
-                );
+                v.push(Widget::new(cx - 196.0 * s, y0 + 42.0 * s, 392.0 * s, 32.0 * s, WKind::Pill, Act::Shot, "Captura de pantalla"));
+                v.push(Widget::new(cx - 196.0 * s, y0 + 126.0 * s, 392.0 * s, 24.0 * s, WKind::Pill, Act::OpenShots, "Abrir capturas"));
             }
         }
         v
@@ -4686,7 +4768,7 @@ impl App {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.fg, 0.07 * f);
                     }
                     let col = if wd.on { th.fg } else { th.fg2 };
-                    let ix = if th.tabs_center { cx } else { wd.x + 11.5 * s };
+                    let ix = if th.tabs_center { cx } else { wd.x + 11.0 * s };
                     cv.tab_icon(p, ix, cy, s, col, f);
                 }
                 WKind::Pin => {
@@ -4785,52 +4867,6 @@ impl App {
                         cv.rrect(cx - hw, y - 0.9 * s, hw * 2.0, 1.8 * s, 0.9 * s, col, f);
                     }
                 }
-                WKind::Dc(k) => {
-                    let c2 = if hov { th.surface_hi } else { th.surface };
-                    cv.rrect(wd.x, wd.y, wd.w, wd.h, 14.0 * s, c2, f);
-                    let red: Rgb = (255.0, 69.0, 58.0);
-                    if wd.on {
-                        cv.rrect(wd.x, wd.y, wd.w, wd.h, 14.0 * s, red, 0.22 * f);
-                    }
-                    let col = if wd.on { red } else { th.fg };
-                    let (ix, iy) = (cx, wd.y + 22.0 * s);
-                    let pi = std::f32::consts::PI;
-                    let tk = 2.0 * s;
-                    match k {
-                        0 => {
-                            cv.rrect(ix - 3.5 * s, iy - 11.0 * s, 7.0 * s, 13.0 * s, 3.5 * s, col, f);
-                            cv.arc(ix, iy - 1.0 * s, 7.0 * s, 0.0, pi, tk, col, f);
-                            cv.line(ix, iy + 6.0 * s, ix, iy + 10.0 * s, tk, col, f);
-                            cv.line(ix - 3.5 * s, iy + 10.0 * s, ix + 3.5 * s, iy + 10.0 * s, tk, col, f);
-                            if wd.on {
-                                cv.line(ix - 9.0 * s, iy - 10.0 * s, ix + 9.0 * s, iy + 11.0 * s, 2.4 * s, red, f);
-                            }
-                        }
-                        1 => {
-                            cv.arc(ix, iy + 1.0 * s, 8.5 * s, pi, 2.0 * pi, tk, col, f);
-                            cv.rrect(ix - 11.0 * s, iy + 0.5 * s, 5.0 * s, 9.0 * s, 2.5 * s, col, f);
-                            cv.rrect(ix + 6.0 * s, iy + 0.5 * s, 5.0 * s, 9.0 * s, 2.5 * s, col, f);
-                            if wd.on {
-                                cv.line(ix - 10.0 * s, iy - 10.0 * s, ix + 10.0 * s, iy + 11.0 * s, 2.4 * s, red, f);
-                            }
-                        }
-                        2 => {
-                            let col = (255.0, 69.0, 58.0);
-                            cv.arc(ix, iy + 4.0 * s, 9.0 * s, pi, 2.0 * pi, 3.2 * s, col, f);
-                            cv.rrect(ix - 12.0 * s, iy + 2.5 * s, 6.0 * s, 5.0 * s, 2.0 * s, col, f);
-                            cv.rrect(ix + 6.0 * s, iy + 2.5 * s, 6.0 * s, 5.0 * s, 2.0 * s, col, f);
-                        }
-                        _ => {
-                            cv.line(ix - 8.0 * s, iy - 7.0 * s, ix + 2.0 * s, iy - 7.0 * s, tk, col, f);
-                            cv.line(ix - 8.0 * s, iy + 8.0 * s, ix + 7.0 * s, iy + 8.0 * s, tk, col, f);
-                            cv.line(ix - 8.0 * s, iy - 7.0 * s, ix - 8.0 * s, iy + 8.0 * s, tk, col, f);
-                            cv.line(ix + 7.0 * s, iy + 8.0 * s, ix + 7.0 * s, iy + 1.0 * s, tk, col, f);
-                            cv.line(ix - 1.0 * s, iy + 1.0 * s, ix + 8.0 * s, iy - 8.0 * s, tk, col, f);
-                            cv.line(ix + 8.0 * s, iy - 8.0 * s, ix + 2.0 * s, iy - 8.0 * s, tk, col, f);
-                            cv.line(ix + 8.0 * s, iy - 8.0 * s, ix + 8.0 * s, iy - 2.0 * s, tk, col, f);
-                        }
-                    }
-                }
                 WKind::Selector => {
                     if hov {
                         cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), th.surface, 0.7 * f);
@@ -4892,7 +4928,10 @@ impl App {
                     let c2 = if hov { th.surface_hi } else { th.surface };
                     cv.rrect(wd.x, wd.y, wd.w, wd.h, self.rad(wd.h), c2, f);
                 }
-                WKind::Bar | WKind::Label => {}
+                WKind::Card => {
+                    cv.rrect(wd.x, wd.y, wd.w, wd.h, 14.0 * s, th.surface, 0.5 * f);
+                }
+                WKind::Bar | WKind::Label | WKind::Header => {}
             }
         }
     }
@@ -4907,7 +4946,8 @@ impl App {
         let vis = self.feat(F_VIS);
         let cover_or_placeholder = |cv: &mut Canvas, x: f32, y: f32, size: f32, r: f32| match &m.cover {
             Some(c) => cv.cover(c, x, y, size, r, f),
-            None => cv.rrect(x, y, size, size, r, th.surface, f),
+            None if self.feat(F_COVER) => cv.rrect(x, y, size, size, r, th.surface, f),
+            None => {}
         };
 
         match mode {
@@ -4927,10 +4967,6 @@ impl App {
                         (weather::icon_kind(wx.code), wx.is_day)
                     };
                     cv.weather_icon(kind, is_day, x0 + 20.0 * s, y0 + h / 2.0, 9.0 * s, f);
-                }
-                7 => {
-                    let pulse = 0.55 + 0.45 * (t * 3.0).sin().abs();
-                    cv.circle(x0 + 18.0 * s, y0 + h / 2.0, 4.5 * s, (255.0, 69.0, 58.0), f * pulse);
                 }
                 8 => {
                     let col = if self.pomo_phase == 0 { th.accent } else { th.good };
@@ -4956,6 +4992,21 @@ impl App {
                                 cv.rrect(bx0, yc - 2.0 * s, len.max(0.5), 4.0 * s, 2.0 * s, acc, f);
                                 cv.circle(bx0 + len, yc, 4.5 * s, th.knob, f);
                             }
+                        }
+                    }
+                    Page::Color => {
+                        let ix = cxm - 196.0 * s;
+                        let rr = if th.sharp { 2.0 * s } else { 12.0 * s };
+                        cv.rrect(ix - 1.0 * s, y0 + 41.0 * s, 50.0 * s, 50.0 * s, rr + 1.0 * s, th.fg, 0.18 * f);
+                        cv.rrect(ix, y0 + 42.0 * s, 48.0 * s, 48.0 * s, rr, color_f(self.cur_color), f);
+                        for (i, &c) in self.colors.iter().enumerate().take(12) {
+                            let (px, py) = (ix + i as f32 * 31.0 * s + 13.0 * s, y0 + 131.0 * s);
+                            if self.hover_act == Some(Act::HistColor(i)) {
+                                cv.circle(px, py, 13.5 * s, th.fg, 0.35 * f);
+                            } else if c == self.cur_color {
+                                cv.circle(px, py, 13.5 * s, th.accent, f);
+                            }
+                            cv.circle(px, py, 11.0 * s, color_f(c), f);
                         }
                     }
                     Page::Clock => {
@@ -5031,16 +5082,32 @@ impl App {
                     }
                     Page::System => {
                         let st = self.sys;
-                        let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
-                        let bw = rx - lx;
-                        cv.rrect(lx, y0 + 58.0 * s, bw, 6.0 * s, 3.0 * s, th.track, f);
-                        cv.rrect(lx, y0 + 58.0 * s, bw * (st.cpu / 100.0).clamp(0.0, 1.0), 6.0 * s, 3.0 * s, th.accent, f);
-                        cv.spark(lx, y0 + 68.0 * s, bw, 18.0 * s, &self.sys_cpu_hist, th.accent, f);
-                        cv.rrect(lx, y0 + 112.0 * s, bw, 6.0 * s, 3.0 * s, th.track, f);
-                        cv.rrect(lx, y0 + 112.0 * s, bw * (st.ram_pct / 100.0).clamp(0.0, 1.0), 6.0 * s, 3.0 * s, th.good, f);
-                        cv.spark(lx, y0 + 122.0 * s, bw, 18.0 * s, &self.sys_ram_hist, th.good, f);
-                        cv.rrect(lx, y0 + 168.0 * s, bw, 6.0 * s, 3.0 * s, th.track, f);
-                        cv.rrect(lx, y0 + 168.0 * s, bw * (st.disk_pct / 100.0).clamp(0.0, 1.0), 6.0 * s, 3.0 * s, th.fg2, f);
+                        let rr = if th.sharp { 2.0 * s } else { 16.0 * s };
+                        let ring_cx = |tx: f32| tx + 14.0 * s + 28.0 * s;
+                        for i in 0..4 {
+                            let (tx, ty, tw, tt) = self.sys_tile(cxm, y0, i);
+                            cv.rrect(tx, ty, tw, tt, rr, th.surface, 0.7 * f);
+                            let cy = ty + tt / 2.0;
+                            match i {
+                                0 => {
+                                    cv.gauge(ring_cx(tx), cy, 25.0 * s, 6.0 * s, st.cpu / 100.0, th.accent, th.track, f);
+                                    cv.spark(tx + 80.0 * s, ty + 36.0 * s, tw - 92.0 * s, 38.0 * s, &self.sys_cpu_hist, th.accent, f);
+                                }
+                                1 => {
+                                    cv.gauge(ring_cx(tx), cy, 25.0 * s, 6.0 * s, st.ram_pct / 100.0, th.good, th.track, f);
+                                    cv.spark(tx + 80.0 * s, ty + 52.0 * s, tw - 92.0 * s, 24.0 * s, &self.sys_ram_hist, th.good, f);
+                                }
+                                2 => {
+                                    cv.gauge(ring_cx(tx), cy, 25.0 * s, 6.0 * s, st.disk_pct / 100.0, th.fg, th.track, f);
+                                }
+                                _ => {
+                                    let (ax, ay) = (tx + 22.0 * s, ty + 42.0 * s);
+                                    cv.poly(&[(ax - 5.0 * s, ay - 3.0 * s), (ax + 5.0 * s, ay - 3.0 * s), (ax, ay + 4.0 * s)], th.good, f);
+                                    let by = ty + 66.0 * s;
+                                    cv.poly(&[(ax - 5.0 * s, by + 3.0 * s), (ax + 5.0 * s, by + 3.0 * s), (ax, by - 4.0 * s)], th.accent, f);
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -5083,7 +5150,9 @@ impl App {
                     self.txt(self.font_main, &fmt_sw(self.sw_elapsed()), x0 + 36.0 * s, y0, x0 + w - 10.0 * s, y0 + h, th.good, f, center);
                 }
                 2 => {
-                    self.txt(self.font_small, &m.title, x0 + 40.0 * s, y0, x0 + w - 40.0 * s, y0 + h, fg, f, center);
+                    let lpad = if self.feat(F_COVER) { 40.0 } else { 14.0 };
+                    let rpad = if self.feat(F_VIS) { 40.0 } else { 14.0 };
+                    self.txt(self.font_small, &m.title, x0 + lpad * s, y0, x0 + w - rpad * s, y0 + h, fg, f, center);
                 }
                 5 => {
                     let ly = self.lyrics.lock().unwrap();
@@ -5100,21 +5169,6 @@ impl App {
                     let t2 = format!("{}  {}°", clock, temp.round());
                     self.txt(self.font_main, &t2, x0 + 36.0 * s, y0, x0 + w - 10.0 * s, y0 + h, fg, f, center);
                 }
-                7 => {
-                    let secs = self.recorder.as_ref().map(|r| r.elapsed().as_secs_f64()).unwrap_or(0.0);
-                    let t2 = format!("REC {}", fmt_time(secs));
-                    self.txt(
-                        self.font_main,
-                        &t2,
-                        x0 + 30.0 * s,
-                        y0,
-                        x0 + w - 8.0 * s,
-                        y0 + h,
-                        (255.0, 69.0, 58.0),
-                        f,
-                        left,
-                    );
-                }
                 8 => {
                     let col = if self.pomo_end.is_some() {
                         if self.pomo_phase == 0 { accent } else { th.good }
@@ -5130,8 +5184,9 @@ impl App {
                 match page {
                     Page::Music => {
                         if m.has {
-                            self.txt(self.font_main, &m.title, cxm - 126.0 * s, y0 + 44.0 * s, cxm + 160.0 * s, y0 + 66.0 * s, fg, f, left);
-                            self.txt(self.font_small, &m.artist, cxm - 126.0 * s, y0 + 67.0 * s, cxm + 160.0 * s, y0 + 85.0 * s, fg2, f, left);
+                            let tx0 = if self.feat(F_COVER) { cxm - 126.0 * s } else { cxm - 194.0 * s };
+                            self.txt(self.font_main, &m.title, tx0, y0 + 44.0 * s, cxm + 160.0 * s, y0 + 66.0 * s, fg, f, left);
+                            self.txt(self.font_small, &m.artist, tx0, y0 + 67.0 * s, cxm + 160.0 * s, y0 + 85.0 * s, fg2, f, left);
                             if m.dur > 0.0 {
                                 self.txt(self.font_small, &fmt_time(m.cur_pos()), cxm - 208.0 * s, y0 + 98.0 * s, cxm - 154.0 * s, y0 + 118.0 * s, fg2, f, right);
                                 self.txt(self.font_small, &fmt_time(m.dur), cxm + 154.0 * s, y0 + 98.0 * s, cxm + 208.0 * s, y0 + 118.0 * s, fg2, f, left);
@@ -5268,6 +5323,18 @@ impl App {
                         };
                         self.txt(self.font_big, &big, cxm - 168.0 * s, y0 + 54.0 * s, cxm + 168.0 * s, y0 + 90.0 * s, fg, f, right);
                     }
+                    Page::Color => {
+                        let ix = cxm - 196.0 * s;
+                        let c = self.cur_color;
+                        self.txt(self.font_main, &color_hex(c), ix + 60.0 * s, y0 + 44.0 * s, cxm + 8.0 * s, y0 + 66.0 * s, fg, f, left);
+                        let rgb = format!("RGB {}, {}, {}", (c >> 16) & 255, (c >> 8) & 255, c & 255);
+                        self.txt(self.font_small, &rgb, ix + 60.0 * s, y0 + 66.0 * s, cxm + 8.0 * s, y0 + 86.0 * s, fg2, f, left);
+                        if self.pick != 0 {
+                            self.txt(self.font_small, "Clic o Enter para fijar · Esc cancela", cxm + 14.0 * s, y0 + 72.0 * s, cxm + 200.0 * s, y0 + 90.0 * s, fg2, f, left);
+                        }
+                        let hist = if self.colors.is_empty() { "Los colores que elijas aparecerán aquí" } else { "Historial (clic para copiar)" };
+                        self.txt(self.font_small, hist, ix, y0 + 96.0 * s, cxm + 196.0 * s, y0 + 116.0 * s, fg2, f, left);
+                    }
                     Page::Todo => {
                         if self.todos.is_empty() {
                             self.txt(self.font_small, "Sin tareas. Escribe arriba y pulsa Enter.", cxm - 196.0 * s, y0 + 80.0 * s, cxm + 196.0 * s, y0 + 110.0 * s, fg2, f, center);
@@ -5278,13 +5345,27 @@ impl App {
                         let plain = DT_SINGLELINE | DT_NOPREFIX | DT_LEFT | DT_VCENTER;
                         match &self.book {
                             Some(b) => {
-                                let head = if b.author.is_empty() { b.title.clone() } else { format!("{} · {}", b.title, b.author) };
-                                self.txt(self.font_small, &head, cxm - 124.0 * s, y0 + 37.0 * s, cxm + 124.0 * s, y0 + 59.0 * s, fg2, f, center);
-                                if let Some(page) = self.book_pages.get(self.book_page) {
+                                let head = b.title.clone();
+                                self.txt(self.font_small, &head, cxm - 96.0 * s, y0 + 37.0 * s, cxm + 96.0 * s, y0 + 59.0 * s, fg2, f, center);
+                                let pitch = book_dims(self.cfg.book_fs).1;
+                                if self.book_toc {
+                                    let cur = self.book_pos.0;
+                                    for k in 0..7usize {
+                                        let i = self.book_toc_scroll + k;
+                                        if i >= b.chapters.len() {
+                                            break;
+                                        }
+                                        let t = y0 + 62.0 * s + k as f32 * 20.0 * s;
+                                        let name = b.chapters[i].title.trim();
+                                        let label = if name.is_empty() { format!("Capítulo {}", i + 1) } else { format!("{}. {}", i + 1, name) };
+                                        let col = if i == cur { accent } else { fg };
+                                        self.txt(self.font_small, &label, lx + 6.0 * s, t, rx - 6.0 * s, t + 20.0 * s, col, f, plain);
+                                    }
+                                } else if let Some(page) = self.book_pages.get(self.book_page) {
                                     for (k, l) in page.iter().enumerate() {
-                                        let t = y0 + 62.0 * s + k as f32 * BOOK_PITCH * s;
-                                        let (font, col, fmt) = if l.heading { (self.font_main, accent, center) } else { (self.font_small, fg, plain) };
-                                        self.txt(font, &l.text, lx, t, rx, t + BOOK_PITCH * s, col, f, fmt);
+                                        let t = y0 + 62.0 * s + k as f32 * pitch * s;
+                                        let (font, col, fmt) = if l.heading { (self.font_main, accent, center) } else { (self.font_book, fg, plain) };
+                                        self.txt(font, &l.text, lx, t, rx, t + pitch * s, col, f, fmt);
                                     }
                                 }
                                 let ch = self.book_pos.0.min(b.chapters.len() - 1);
@@ -5292,7 +5373,13 @@ impl App {
                                 let done = b.before[ch] as f32 + b.chapters[ch].chars as f32 * (self.book_page as f32 / np as f32);
                                 let pct = (done * 100.0 / b.total_chars as f32).floor().clamp(0.0, 100.0) as i32;
                                 self.txt(self.font_small, &format!("{}%", pct), rx - 64.0 * s, y0 + 37.0 * s, rx, y0 + 59.0 * s, fg2, f, right);
-                                let info = format!("Cap. {}/{} · pág. {}/{}", ch + 1, b.chapters.len(), self.book_page + 1, np);
+                                let ct = b.chapters[ch].title.trim();
+                                let ct: String = if ct.chars().count() > 22 { ct.chars().take(21).chain("…".chars()).collect() } else { ct.to_string() };
+                                let info = if ct.is_empty() {
+                                    format!("Cap. {}/{} · pág. {}/{}", ch + 1, b.chapters.len(), self.book_page + 1, np)
+                                } else {
+                                    format!("{}/{} · {} · pág. {}/{}", ch + 1, b.chapters.len(), ct, self.book_page + 1, np)
+                                };
                                 self.txt(self.font_small, &info, cxm - 126.0 * s, y0 + 210.0 * s, cxm + 126.0 * s, y0 + 234.0 * s, fg2, f, center);
                             }
                             None => {
@@ -5347,24 +5434,45 @@ impl App {
                     }
                     Page::System => {
                         let st = self.sys;
-                        let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
-                        self.txt(self.font_small, "CPU", lx, y0 + 38.0 * s, cxm, y0 + 56.0 * s, fg2, f, left);
-                        self.txt(self.font_small, &format!("{:.0}%", st.cpu), cxm, y0 + 38.0 * s, rx, y0 + 56.0 * s, fg, f, right);
-                        self.txt(self.font_small, "RAM", lx, y0 + 92.0 * s, cxm, y0 + 110.0 * s, fg2, f, left);
-                        let ram = format!("{} / {} · {:.0}%", fmt_bytes(st.ram_used), fmt_bytes(st.ram_total), st.ram_pct);
-                        self.txt(self.font_small, &ram, cxm, y0 + 92.0 * s, rx, y0 + 110.0 * s, fg, f, right);
-                        self.txt(self.font_small, "Disco C:", lx, y0 + 148.0 * s, cxm, y0 + 166.0 * s, fg2, f, left);
-                        let disk = format!("{} libres de {}", fmt_bytes(st.disk_free), fmt_bytes(st.disk_total));
-                        self.txt(self.font_small, &disk, cxm, y0 + 148.0 * s, rx, y0 + 166.0 * s, fg, f, right);
-                        self.txt(self.font_small, "Red", lx, y0 + 184.0 * s, cxm, y0 + 202.0 * s, fg2, f, left);
-                        let net = format!("↓ {}   ↑ {}", fmt_speed(st.net_down), fmt_speed(st.net_up));
-                        self.txt(self.font_small, &net, cxm, y0 + 184.0 * s, rx, y0 + 202.0 * s, fg, f, right);
-                        self.txt(self.font_small, "Encendido", lx, y0 + 206.0 * s, cxm, y0 + 224.0 * s, fg2, f, left);
-                        let mut up = fmt_uptime(st.uptime);
-                        if self.batt.has {
-                            up.push_str(&format!("  ·  {}%", self.batt.pct));
+                        for i in 0..4 {
+                            let (tx, ty, tw, tt) = self.sys_tile(cxm, y0, i);
+                            let (rl, rr_) = (tx + 80.0 * s, tx + tw - 10.0 * s);
+                            let ring = |pct: f32| {
+                                let (ccx, ccy) = (tx + 42.0 * s, ty + tt / 2.0);
+                                (format!("{:.0}%", pct), ccx - 24.0 * s, ccy - 10.0 * s, ccx + 24.0 * s, ccy + 10.0 * s)
+                            };
+                            match i {
+                                0 => {
+                                    let (t, l, t0, r, b) = ring(st.cpu);
+                                    self.txt(self.font_main, &t, l, t0, r, b, fg, f, center);
+                                    self.txt(self.font_small, "CPU", rl, ty + 10.0 * s, rr_, ty + 30.0 * s, fg2, f, left);
+                                }
+                                1 => {
+                                    let (t, l, t0, r, b) = ring(st.ram_pct);
+                                    self.txt(self.font_main, &t, l, t0, r, b, fg, f, center);
+                                    self.txt(self.font_small, "Memoria", rl, ty + 10.0 * s, rr_, ty + 30.0 * s, fg2, f, left);
+                                    let ram = format!("{} / {}", fmt_bytes(st.ram_used), fmt_bytes(st.ram_total));
+                                    self.txt(self.font_small, &ram, rl, ty + 28.0 * s, rr_, ty + 48.0 * s, fg, f, left);
+                                }
+                                2 => {
+                                    let (t, l, t0, r, b) = ring(st.disk_pct);
+                                    self.txt(self.font_main, &t, l, t0, r, b, fg, f, center);
+                                    self.txt(self.font_small, "Disco C:", rl, ty + 10.0 * s, rr_, ty + 30.0 * s, fg2, f, left);
+                                    self.txt(self.font_small, &format!("{} libres", fmt_bytes(st.disk_free)), rl, ty + 34.0 * s, rr_, ty + 54.0 * s, fg, f, left);
+                                    self.txt(self.font_small, &format!("de {}", fmt_bytes(st.disk_total)), rl, ty + 52.0 * s, rr_, ty + 72.0 * s, fg2, f, left);
+                                }
+                                _ => {
+                                    self.txt(self.font_small, "Red", tx + 14.0 * s, ty + 8.0 * s, tx + tw - 10.0 * s, ty + 28.0 * s, fg2, f, left);
+                                    self.txt(self.font_main, &fmt_speed(st.net_down), tx + 36.0 * s, ty + 32.0 * s, tx + tw - 10.0 * s, ty + 52.0 * s, fg, f, left);
+                                    self.txt(self.font_main, &fmt_speed(st.net_up), tx + 36.0 * s, ty + 56.0 * s, tx + tw - 10.0 * s, ty + 76.0 * s, fg, f, left);
+                                }
+                            }
                         }
-                        self.txt(self.font_small, &up, cxm, y0 + 206.0 * s, rx, y0 + 224.0 * s, fg, f, right);
+                        let mut up = format!("Encendido {}", fmt_uptime(st.uptime));
+                        if self.batt.has {
+                            up.push_str(&format!("  ·  Batería {}%", self.batt.pct));
+                        }
+                        self.txt(self.font_small, &up, cxm - 196.0 * s, y0 + 226.0 * s, cxm + 196.0 * s, y0 + 246.0 * s, fg2, f, center);
                     }
                     Page::Mixer => {
                         let st = self.mixer.as_ref().map(|mx| mx.state()).unwrap_or_default();
@@ -5387,24 +5495,13 @@ impl App {
                     }
                     Page::Capture => {
                         let (lx, rx) = (cxm - 196.0 * s, cxm + 196.0 * s);
-                        if let Some(r) = &self.recorder {
-                            let line = format!("● Grabando {} · Ctrl+Alt+R para detener", fmt_time(r.elapsed().as_secs_f64()));
-                            self.txt(self.font_small, &line, lx, y0 + 80.0 * s, rx, y0 + 100.0 * s, (255.0, 69.0, 58.0), f, center);
-                        } else {
-                            self.txt(self.font_small, "Listo. Ctrl+Alt+S captura, Ctrl+Alt+R graba.", lx, y0 + 80.0 * s, rx, y0 + 100.0 * s, fg, f, center);
-                        }
-                        let info = if !self.last_video.is_empty() {
-                            format!("Último vídeo: {}", tail_chars(&self.last_video, 52))
-                        } else if !self.last_shot.is_empty() {
+                        self.txt(self.font_small, "Listo. Ctrl+Alt+S captura toda la pantalla.", lx, y0 + 82.0 * s, rx, y0 + 102.0 * s, fg, f, center);
+                        let info = if !self.last_shot.is_empty() {
                             format!("Última captura: {}", tail_chars(&self.last_shot, 52))
                         } else {
-                            "Se guardan en Imágenes\\DynamicIsland y Vídeos\\DynamicIsland".to_string()
+                            "Se guardan en Imágenes\\DynamicIsland".to_string()
                         };
                         self.txt(self.font_small, &info, lx, y0 + 102.0 * s, rx, y0 + 120.0 * s, fg2, f, center);
-                        self.txt(self.font_small, "Ctrl+Alt+S captura · Ctrl+Alt+R graba/detiene", lx, y0 + 188.0 * s, rx, y0 + 204.0 * s, fg2, f, center);
-                    }
-                    Page::Discord => {
-                        self.txt(self.font_small, "Atajos de Discord: Ctrl+Shift+M · Ctrl+Shift+D · Ctrl+Shift+X (desconectar)", cxm - 196.0 * s, y0 + 116.0 * s, cxm + 196.0 * s, y0 + 136.0 * s, fg2, f, center);
                     }
                     Page::Settings => {}
                 }
@@ -5415,7 +5512,7 @@ impl App {
                     match wd.kind {
                         WKind::Tab(_) => {
                             if wd.on && !th.tabs_center {
-                                self.txt(self.font_small, wd.label, l + 23.0 * s, t, r, b, fg, f, left);
+                                self.txt(self.font_small, wd.label, l + 22.0 * s, t, r, b, fg, f, left);
                             }
                         }
                         WKind::Pill => self.txt(self.font_small, wd.label, l, t, r, b, fg, f, center),
@@ -5425,7 +5522,6 @@ impl App {
                         }
                         WKind::Lyric => {}
                         WKind::Heart => {}
-                        WKind::Dc(_) => self.txt(self.font_small, wd.label, l, t + wd.h * 0.6, r, b - 2.0 * s, fg, f, center),
                         WKind::Source => {
                             let auto = self.cfg.source.is_empty();
                             let name = if m.source.is_empty() { "—".to_string() } else { m.source.clone() };
@@ -5448,6 +5544,7 @@ impl App {
                         }
                         WKind::Toggle => self.txt(self.font_small, wd.label, l + 4.0 * s, t, r - 46.0 * s, b, fg, f, left),
                         WKind::Label => self.txt(self.font_small, wd.label, l, t, r, b, fg, f, left),
+                        WKind::Header => self.txt(self.font_main, wd.label, l, t, r, b, fg, f, left),
                         WKind::Selector => self.txt(self.font_small, wd.label2, l, t, r, b, fg, f, center),
                         WKind::Slider => {
                             let val = match wd.act {
@@ -5469,7 +5566,7 @@ impl App {
                         }
                         WKind::Input => {
                             let (text, ph) = match wd.act {
-                                Act::CityInput => (&self.city_input, "Ciudad (ej. Madrid)"),
+                                Act::CityInput => (&self.city_input, "Ciudad…"),
                                 _ => (&self.todo_input, "Añadir tarea…"),
                             };
                             if text.is_empty() && !self.editing {
@@ -5749,27 +5846,17 @@ fn tray_remove(hwnd: HWND) {
 }
 
 /// Cambia el texto flotante del icono de la bandeja (por ejemplo, al grabar).
-fn set_tray_tip(hwnd: HWND, tip: &str) {
-    unsafe {
-        let nid = tray_data(hwnd, tip);
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-}
-
-/// Ctrl+Alt+S captura y Ctrl+Alt+R graba/detiene. Devuelve false si alguno esta ocupado.
+/// Ctrl+Alt+S captura la pantalla. Devuelve false si el atajo esta ocupado.
 fn register_hotkeys(hwnd: HWND) -> bool {
     unsafe {
         let mods = HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_NOREPEAT.0);
-        let a = RegisterHotKey(hwnd, 1, mods, 'S' as u32).is_ok();
-        let b = RegisterHotKey(hwnd, 2, mods, 'R' as u32).is_ok();
-        a && b
+        RegisterHotKey(hwnd, 1, mods, 'S' as u32).is_ok()
     }
 }
 
 fn unregister_hotkeys(hwnd: HWND) {
     unsafe {
         let _ = UnregisterHotKey(hwnd, 1);
-        let _ = UnregisterHotKey(hwnd, 2);
     }
 }
 
@@ -5853,9 +5940,7 @@ fn show_menu(hwnd: HWND) -> i32 {
         let _ = AppendMenuW(menu, MF_STRING, 150, w!("Restablecer posición"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, 160, w!("Captura de pantalla\tCtrl+Alt+S"));
-        let _ = AppendMenuW(menu, MF_STRING, 161, w!("Grabar / detener\tCtrl+Alt+R"));
         let _ = AppendMenuW(menu, MF_STRING, 162, w!("Abrir capturas"));
-        let _ = AppendMenuW(menu, MF_STRING, 163, w!("Abrir grabaciones"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let fl = if auto { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, fl, 120, w!("Iniciar con Windows"));
@@ -5880,6 +5965,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 with_app(|a| match id {
                     T_VIS => a.vis_tick(),
                     T_PROX => a.prox_tick(),
+                    T_PICK => a.pick_tick(),
                     _ => a.clock_tick(),
                 });
                 LRESULT(0)
@@ -5978,7 +6064,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_HOTKEY => {
                 match wp.0 {
                     1 => with_app(|a| a.take_shot()),
-                    2 => with_app(|a| a.toggle_recording()),
                     _ => {}
                 }
                 LRESULT(0)
@@ -5989,13 +6074,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 LRESULT(if ed { MA_ACTIVATE_ } else { MA_NOACTIVATE_ })
             }
             WM_DESTROY => {
-                with_app(|a| {
-                    if let Some(r) = a.recorder.take() {
-                        let _ = r.stop();
-                    }
-                });
                 let _ = UnregisterHotKey(hwnd, 1);
-                let _ = UnregisterHotKey(hwnd, 2);
                 tray_remove(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -6108,6 +6187,8 @@ fn main() -> windows::core::Result<()> {
         let long_ago = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
         let now_t = GetLocalTime();
         let book_saved = load_book_state();
+        let cfg_book_fs = cfg.book_fs;
+        let colors0 = load_colors();
         let app = App {
             hwnd,
             mem,
@@ -6159,7 +6240,6 @@ fn main() -> windows::core::Result<()> {
             low_warned: false,
             features,
             autostart: autostart_enabled(),
-            settings_tab: 0,
             time_tab: 0,
             pomo_phase: 0,
             pomo_round: 0,
@@ -6190,13 +6270,10 @@ fn main() -> windows::core::Result<()> {
             sys_sampler: system::Sampler::default(),
             sys_cpu_hist: Vec::new(),
             sys_ram_hist: Vec::new(),
-            recorder: None,
             mixer: None,
             mix_override: 0.0,
             mix_last: -1.0,
-            rec_hidden: false,
             last_shot: String::new(),
-            last_video: String::new(),
             slider_drag: None,
             drag: None,
             prev_fg: 0,
@@ -6207,9 +6284,13 @@ fn main() -> windows::core::Result<()> {
             book_pos: book_saved.1,
             book_pages: Vec::new(),
             book_page: 0,
-            dc_mute: false,
-            dc_deaf: false,
-            book_pk: (usize::MAX, 0, 0, 0),
+            book_pk: (usize::MAX, 0, 0, 0, 0),
+            pick: 0,
+            cur_color: colors0.first().copied().unwrap_or(0xFF9500),
+            colors: colors0,
+            book_toc: false,
+            book_toc_scroll: 0,
+            font_book: make_font(face, (book_dims_px(cfg_book_fs) as f32 * s) as i32, 400, false),
             tab_x: -1.0,
             last_media: Media::default(),
             prev_media: None,

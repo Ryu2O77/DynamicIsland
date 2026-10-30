@@ -641,6 +641,7 @@ pub struct Chapter {
 pub struct Book {
     pub path: String,
     pub title: String,
+    #[allow(dead_code)] // reservado para la futura biblioteca
     pub author: String,
     pub chapters: Vec<Chapter>,
     /// caracteres acumulados antes de cada capítulo (para el porcentaje)
