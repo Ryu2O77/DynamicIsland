@@ -492,7 +492,6 @@ enum Act {
     CitySearch,
     WeatherRefresh,
     WeatherLocate,
-    Shot,
     MixMute(usize),
     MixDevice(usize),
     Source,
@@ -4360,7 +4359,7 @@ impl App {
         let half = self.cur[0] / 2.0;
 
         // barra de pestañas (iconos; la activa muestra su nombre)
-        const TABS: [(Page, &str, f32); 13] = [
+        const TABS: [(Page, &str, f32); 12] = [
             (Page::Music, "Música", 46.0),
             (Page::Clock, "Reloj", 36.0),
             (Page::Calendar, "Cal.", 30.0),
